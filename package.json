@@ -10,7 +10,8 @@
     "preview": "vite preview --host 127.0.0.1 --port 1421 --strictPort",
     "desktop": "tauri dev",
     "desktop:build": "tauri build --debug --bundles app --no-sign",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "node --experimental-transform-types --input-type=module -e \"import('./src/app/store.regression.ts').then(async m => console.log(await m.runStoreRegressionChecks()))\""
   },
   "dependencies": {
     "@phosphor-icons/react": "2.1.10",
