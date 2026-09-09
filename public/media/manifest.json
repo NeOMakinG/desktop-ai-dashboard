@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "source": "higgsfield",
+  "images": {
+    "cozy": null,
+    "coast": null
+  },
+  "video": {
+    "ambient": null,
+    "poster": null
+  }
+}
