@@ -1,7 +1,11 @@
 //! Google OAuth 2.0 PKCE plumbing, gated behind a build-time client id.
 //! No authorization codes or tokens are logged, emitted, or saved in SQLite.
+mod grants;
 mod keychain;
 mod lifecycle;
+mod reads;
+pub use grants::{ConnectorGrant, EgressConsent, GrantRequest, ReadOperation, RuntimeReadContext};
+pub use reads::{dispatch_runtime_read, validate_runtime_delivery, ConnectorReadResult};
 mod loopback;
 mod oauth;
 mod store;
@@ -403,7 +407,21 @@ fn begin_refresh(
     core: &Arc<ConnectorsCore>,
     id: &str,
 ) -> AppResult<(RefreshLease, Zeroizing<String>)> {
+    begin_refresh_checked(core, id, None)
+}
+fn begin_refresh_checked(
+    core: &Arc<ConnectorsCore>,
+    id: &str,
+    read: Option<(&RuntimeReadContext, &str)>,
+) -> AppResult<(RefreshLease, Zeroizing<String>)> {
     let mut life = lifecycle_guard(core)?;
+    if let Some((context, lease_id)) = read {
+        if context.connection_id != id {
+            return Err(grants::denied());
+        }
+        life.grants
+            .check_read(context, lease_id, chrono::Utc::now().timestamp_millis())?;
+    }
     if store_guard(core)?.get(id)?.is_none() {
         return Err(AppError::new("not_found", "That connector was not found."));
     }
@@ -436,19 +454,39 @@ fn commit_refresh(
     previous_refresh: &str,
     tokens: oauth::TokenResponse,
 ) -> AppResult<ConnectorStatus> {
+    commit_refresh_checked(lease, previous_refresh, tokens, None)
+}
+fn commit_refresh_checked(
+    lease: &RefreshLease,
+    previous_refresh: &str,
+    tokens: oauth::TokenResponse,
+    read: Option<(&RuntimeReadContext, &str)>,
+) -> AppResult<ConnectorStatus> {
     let core = &lease.core;
     let mut life = lifecycle_guard(core)?;
+    if let Some((context, lease_id)) = read {
+        if context.connection_id != lease.id {
+            return Err(grants::denied());
+        }
+        life.grants
+            .check_read(context, lease_id, chrono::Utc::now().timestamp_millis())?;
+    }
     life.check_refresh(&lease.id, &lease.generation)?;
     let store = store_guard(core)?;
     let mut status = store.get(&lease.id)?.ok_or_else(lifecycle::stale_error)?;
+    let previous_scopes = status.scopes.clone();
     status.scopes = match granted_scopes(tokens.scope.as_deref(), &status.scopes, true) {
         Ok(scopes) => scopes,
         Err(error) => {
+            life.grants.revoke_connection(&status.id);
             store.mark_disconnected(&status.id)?;
             life.revision += 1;
             return Err(rollback_staged(core, &store, &status.id, error));
         }
     };
+    if previous_scopes != status.scopes {
+        life.grants.revoke_connection(&status.id);
+    }
     status.expires_at =
         oauth::expires_at_from_secs(chrono::Utc::now(), tokens.expires_in.unwrap_or(3600));
     let payload = serialize_tokens(
@@ -464,6 +502,7 @@ fn commit_refresh(
         .and_then(|_| store.upsert(&status));
     life.revision += 1;
     if let Err(error) = result {
+        life.grants.revoke_connection(&status.id);
         return Err(rollback_staged(core, &store, &status.id, error));
     }
     life.finish_refresh(&lease.id, &lease.generation);
@@ -640,6 +679,103 @@ pub async fn connectors_disconnect(
     let result = disconnect_impl(&core, &id);
     emit_change(&app); // cleanup failures also change the durable local status
     result
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadCapabilities {
+    live_google: bool,
+    registration_available: bool,
+    reasons: Vec<&'static str>,
+    max_grant_seconds: i64,
+    max_read_seconds: i64,
+    max_window_days: u8,
+    max_items: u16,
+}
+#[tauri::command]
+pub async fn connectors_read_capabilities(window: WebviewWindow) -> AppResult<ReadCapabilities> {
+    crate::first_party(&window)?;
+    let registered = client_id().is_ok();
+    let mut reasons = Vec::new();
+    if !registered {
+        reasons.push("Google OAuth client not configured. A registered desktop client and supported consent setup are required.");
+    }
+    reasons.push("Google compliance and account-read authorization have not been verified for this integration.");
+    reasons.push("Runtime/model retention and revocation of account-derived prompts, history, snapshots and Interface content are not verified. Live egress is blocked.");
+    Ok(ReadCapabilities {
+        live_google: false,
+        registration_available: registered,
+        reasons,
+        max_grant_seconds: grants::MAX_GRANT_SECONDS,
+        max_read_seconds: grants::MAX_READ_SECONDS,
+        max_window_days: 7,
+        max_items: 100,
+    })
+}
+#[tauri::command]
+pub async fn connectors_grants_list(
+    window: WebviewWindow,
+    app: AppHandle,
+) -> AppResult<Vec<ConnectorGrant>> {
+    crate::first_party(&window)?;
+    let core = core(&app)?;
+    let mut life = lifecycle_guard(&core)?;
+    Ok(life.grants.list(chrono::Utc::now().timestamp_millis()))
+}
+#[tauri::command]
+pub async fn connectors_grant_register(
+    window: WebviewWindow,
+    app: AppHandle,
+    request: GrantRequest,
+) -> AppResult<ConnectorGrant> {
+    crate::first_party(&window)?;
+    client_id()?;
+    let core = core(&app)?;
+    let mut life = lifecycle_guard(&core)?;
+    let status = store_guard(&core)?
+        .get(&request.connection_id)?
+        .ok_or_else(grants::denied)?;
+    let grant = life
+        .grants
+        .register(request, &status, chrono::Utc::now().timestamp_millis())?;
+    life.revision += 1;
+    drop(life);
+    emit_change(&app);
+    Ok(grant)
+}
+#[tauri::command]
+pub async fn connectors_grant_revoke(
+    window: WebviewWindow,
+    app: AppHandle,
+    grant_id: String,
+) -> AppResult<()> {
+    crate::first_party(&window)?;
+    validate_id(&grant_id)?;
+    let core = core(&app)?;
+    let mut life = lifecycle_guard(&core)?;
+    life.grants.revoke(&grant_id);
+    life.revision += 1;
+    drop(life);
+    emit_change(&app);
+    Ok(())
+}
+/// Native runtime calls this before remote cancellation, including on config
+/// changes and workspace deletion. No remote acknowledgment is needed to fence.
+pub fn cancel_runtime_run(app: &AppHandle, workspace_id: &str, run_id: &str) -> AppResult<()> {
+    let core = core(app)?;
+    let mut life = lifecycle_guard(&core)?;
+    life.grants
+        .cancel_run(workspace_id, run_id, chrono::Utc::now().timestamp_millis())
+}
+#[tauri::command]
+pub async fn connectors_run_cancel(
+    window: WebviewWindow,
+    app: AppHandle,
+    workspace_id: String,
+    run_id: String,
+) -> AppResult<()> {
+    crate::first_party(&window)?;
+    cancel_runtime_run(&app, &workspace_id, &run_id)
 }
 
 #[cfg(test)]

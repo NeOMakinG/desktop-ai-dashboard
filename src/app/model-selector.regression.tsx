@@ -43,5 +43,12 @@ export function runModelSelectorRegressionChecks(): string[] {
   assert(busy.includes('disabled=""') && busy.includes('Opus 5'), 'Model chip must be visible but disabled for active replies.');
   const unchecked = render({ ...base, settings: { ...base.settings!, provider: { ...base.settings!.provider, verified: false } } });
   assert(unchecked.includes('Needs a check') && !unchecked.includes('>Current<'), 'Unchecked selection must not claim success.');
-  return ['human labels and full-ID search', 'accessible picker semantics and current model', 'loading, empty, unavailable and error recovery', 'browser catalog denial and global reply lock', 'unchecked selection is not success'];
+  const hermes: AppSnapshot = { ...base, activeId: 'chat-b', runtimeWorkspace: { workspaceId: 'chat-b', route: 'hermes', modelId: 'accepted-runtime-model', generation: 1, remoteInitialized: true }, runtime: { state: 'ready', message: null, verified: true, generation: 1, capabilities: null, models: [{ id: 'accepted-runtime-model', name: 'Runtime model', available: true }, { id: 'unavailable-runtime-model', name: 'Unavailable', available: false, reason: 'Not approved' }] } };
+  const hermesHtml = render(hermes);
+  assert(hermesHtml.includes('this workspace only') && hermesHtml.includes('accepted-runtime-model') && !hermesHtml.includes('claude-opus-4-5-20251101') && !hermesHtml.includes('unavailable-runtime-model'), 'Hermes picker must use workspace-accepted model and its own available catalog, never Direct inventory.');
+  const applying = renderToStaticMarkup(createElement(ModelSelector, { state: { ...hermes, selectingModel: true }, store: nativeStore, onSettings: () => {} }));
+  assert(applying.includes('accepted-runtime-model') && applying.includes('Applying model'), 'Pending model change retains accepted model label.');
+  const staleWorkspace = renderToStaticMarkup(createElement(ModelSelector, { state: { ...hermes, activeId: 'chat-c' }, store: nativeStore, onSettings: () => {} }));
+  assert(!staleWorkspace.includes('accepted-runtime-model'), 'A previous workspace’s accepted model must not label the new workspace.');
+  return ['human labels and full-ID search', 'accessible picker semantics and current model', 'loading, empty, unavailable and error recovery', 'browser catalog denial and global reply lock', 'unchecked selection is not success', 'workspace-scoped Hermes catalog and acknowledged model label'];
 }

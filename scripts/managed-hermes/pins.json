@@ -1,0 +1,49 @@
+{
+  "schemaVersion": 1,
+  "hermes": {
+    "commit": "349e6611a1c5d846a865368dd6c386b78edd1a54",
+    "version": "0.20.5",
+    "url": "https://codeload.github.com/NousResearch/hermes-agent/tar.gz/349e6611a1c5d846a865368dd6c386b78edd1a54",
+    "sha256": "0a6c880435af89b10fe626330f33e7ab152a47d07e21c6db90b18397faf74c93",
+    "lockSha256": "77dc0848db9647989f05f664298b48fe63f8cb3a11dae14d04678508372d07d7",
+    "projectSha256": "04115a32c0be51373dfb51eb44243fe66eab97e87a84e992bbbb7fae9e79eead",
+    "licenseSha256": "821556e6336796450ab852d375117b48a4887e71d255794fd6318d99982a5ab6"
+  },
+  "platforms": {
+    "darwin-arm64": {
+      "target": "aarch64-apple-darwin",
+      "minimumOS": "11.0",
+      "inertRpaths": [
+        {
+          "file": "python/lib/python3.12/site-packages/PIL/.dylibs/libjpeg.62.4.0.dylib",
+          "sha256": "cf7c4e5c2d2c007fc51afcb95b649415cfe0bc4d7137ace897a6eff6550fa967",
+          "path": "/Users/runner/work/Pillow/Pillow/build/deps/darwin/lib",
+          "loads": ["/usr/lib/libSystem.B.dylib"],
+          "reason": "Unused upstream linker metadata: this exact image loads only absolute Apple OS libraries; its RPATH is never consulted. No binary/signature modification."
+        }
+      ],
+      "python": {
+        "version": "3.12.12",
+        "release": "20260113",
+        "executable": "python/bin/python3.12",
+        "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20260113/cpython-3.12.12%2B20260113-aarch64-apple-darwin-install_only_stripped.tar.gz",
+        "sha256": "b4fbffc79b72a040ffe3ab4f714864cf9e0166d075576096247dc44fa1883630",
+        "licenses": {
+          "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20260113/cpython-3.12.12%2B20260113-aarch64-apple-darwin-pgo%2Blto-full.tar.zst",
+          "sha256": "bd90cbe76b59aeba9e96396fb15ecaae3bc19bd5e1e486dc8a937c1eba627e52"
+        }
+      },
+      "archiveDecoder": {
+        "version": "0.25.0",
+        "url": "https://files.pythonhosted.org/packages/aa/1c/d920d64b22f8dd028a8b90e2d756e431a5d86194caa78e3819c7bf53b4b3/zstandard-0.25.0-cp312-cp312-macosx_11_0_arm64.whl",
+        "sha256": "913cbd31a400febff93b564a23e17c3ed2d56c064006f54efec210d586171c00"
+      },
+      "exporter": {
+        "version": "0.9.26",
+        "url": "https://github.com/astral-sh/uv/releases/download/0.9.26/uv-aarch64-apple-darwin.tar.gz",
+        "sha256": "fcf0a9ea6599c6ae28a4c854ac6da76f2c889354d7c36ce136ef071f7ab9721f",
+        "executable": "uv-aarch64-apple-darwin/uv"
+      }
+    }
+  }
+}

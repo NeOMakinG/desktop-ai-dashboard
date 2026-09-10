@@ -11,22 +11,21 @@ use std::{
 use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
 
-struct PendingRequest {
-    workspace: String,
-    generation: u64,
-    token: CancellationToken,
-    started: bool,
-}
 pub struct Core {
     pub store: Store,
-    credentials: Box<dyn Credentials>,
-    requests: HashMap<String, PendingRequest>,
+    pub(crate) credentials: Box<dyn Credentials>,
+    pub(crate) runtime_requests: HashMap<String, CancellationToken>,
+    pub(crate) controller: Option<crate::runtime::transport::Controller>,
+    pub(crate) synced_model_generation: Option<u64>,
     check: Option<CancellationToken>,
     discovery: Option<CancellationToken>,
 }
 pub struct NativeState {
     inner: Mutex<AppResult<Core>>,
     pub client: AppResult<reqwest::Client>,
+    pub runtime_gate: tokio::sync::Mutex<()>,
+    pub runtime_stopping: std::sync::atomic::AtomicBool,
+    pub runtime_process: crate::runtime::transport::ProcessOwner,
 }
 pub struct CoreGuard<'a>(MutexGuard<'a, AppResult<Core>>);
 impl std::ops::Deref for CoreGuard<'_> {
@@ -45,6 +44,9 @@ impl NativeState {
         Self {
             inner: Mutex::new(core),
             client: provider::client(),
+            runtime_gate: tokio::sync::Mutex::new(()),
+            runtime_stopping: std::sync::atomic::AtomicBool::new(false),
+            runtime_process: crate::runtime::transport::ProcessOwner::default(),
         }
     }
     pub fn lock(&self) -> AppResult<CoreGuard<'_>> {
@@ -60,12 +62,14 @@ impl Core {
         Self {
             store,
             credentials,
-            requests: HashMap::new(),
+            runtime_requests: HashMap::new(),
+            controller: None,
+            synced_model_generation: None,
             check: None,
             discovery: None,
         }
     }
-    fn key(&self, provider: &StoredProvider) -> AppResult<Option<Zeroizing<String>>> {
+    pub(crate) fn key(&self, provider: &StoredProvider) -> AppResult<Option<Zeroizing<String>>> {
         provider
             .credential
             .as_deref()
@@ -139,9 +143,7 @@ impl Core {
             }
             return Err(error);
         }
-        for (_, pending) in self.requests.drain() {
-            pending.token.cancel();
-        }
+        crate::runtime::managed::provider_changed(self)?;
         if let Some(check) = self.check.take() {
             check.cancel();
         }
@@ -195,35 +197,7 @@ impl Core {
         content: &str,
         request: &str,
     ) -> AppResult<ChatWorkspace> {
-        let provider = self.store.provider()?;
-        if !provider.config.verified
-            || provider.config.base_url.is_empty()
-            || provider.config.model.is_empty()
-        {
-            return Err(AppError::new(
-                "provider_not_ready",
-                "Connect and check your AI provider in Settings before sending.",
-            ));
-        }
-        if self.requests.len() >= 8 {
-            return Err(AppError::new(
-                "busy",
-                "Too many replies are pending. Finish or cancel one first.",
-            ));
-        }
-        self.key(&provider)?;
-        self.store
-            .start(workspace, content, request, provider.generation)?;
-        self.requests.insert(
-            request.to_owned(),
-            PendingRequest {
-                workspace: workspace.to_owned(),
-                generation: provider.generation,
-                token: CancellationToken::new(),
-                started: false,
-            },
-        );
-        self.store.workspace(workspace)
+        crate::runtime::runs::start(self, workspace, content, request)
     }
     pub fn cancel(&mut self, workspace: &str, request: &str) -> AppResult<ChatWorkspace> {
         validation::id(workspace)?;
@@ -237,123 +211,12 @@ impl Core {
             return Err(AppError::missing());
         }
         self.store.cancel_pending(workspace, request)?;
-        if let Some(pending) = self.requests.get(request) {
-            if pending.workspace != workspace {
-                return Err(AppError::missing());
-            }
-        }
-        if let Some(pending) = self.requests.remove(request) {
-            pending.token.cancel();
-        }
         self.store.workspace(workspace)
     }
     pub fn delete(&mut self, workspace: &str) -> AppResult<()> {
         self.store.delete(workspace)?;
-        self.requests.retain(|_, pending| {
-            if pending.workspace == workspace {
-                pending.token.cancel();
-                false
-            } else {
-                true
-            }
-        });
         Ok(())
     }
-    fn begin_complete(&mut self, workspace: &str, request: &str) -> AppResult<Completion> {
-        validation::id(workspace)?;
-        validation::id(request)?;
-        let pending = self.requests.get(request).ok_or_else(AppError::missing)?;
-        if pending.workspace != workspace || pending.started {
-            return Err(AppError::stale());
-        }
-        let generation = pending.generation;
-        let provider = self.store.provider()?;
-        if generation != provider.generation {
-            return Err(AppError::stale());
-        }
-        let key = self.key(&provider)?;
-        let body = provider::chat_body(&provider.config.model, &self.store.workspace(workspace)?)?;
-        let pending = self
-            .requests
-            .get_mut(request)
-            .ok_or_else(AppError::missing)?;
-        pending.started = true;
-        Ok(Completion {
-            base: provider.config.base_url,
-            generation,
-            key,
-            body,
-            token: pending.token.clone(),
-        })
-    }
-    fn apply_complete(
-        &mut self,
-        workspace: &str,
-        request: &str,
-        generation: u64,
-        result: AppResult<String>,
-    ) -> AppResult<ChatWorkspace> {
-        let pending = self.requests.get(request).ok_or_else(AppError::stale)?;
-        if pending.workspace != workspace
-            || pending.generation != generation
-            || pending.token.is_cancelled()
-        {
-            return Err(AppError::stale());
-        }
-        let (status, text) = match &result {
-            Ok(text) => ("complete", text.as_str()),
-            Err(error) => ("error", error.message),
-        };
-        self.store
-            .finish(workspace, request, generation, status, text)?;
-        self.requests.remove(request);
-        // Provider errors become durable visible assistant errors, not a lost history snapshot.
-        self.store.workspace(workspace)
-    }
-}
-struct Completion {
-    base: String,
-    generation: u64,
-    key: Option<Zeroizing<String>>,
-    body: serde_json::Value,
-    token: CancellationToken,
-}
-pub async fn complete(
-    state: &NativeState,
-    workspace: String,
-    request: String,
-) -> AppResult<ChatWorkspace> {
-    let client = state.client.as_ref().map_err(Clone::clone)?;
-    let completion = {
-        let mut core = state.lock()?;
-        match core.begin_complete(&workspace, &request) {
-            Ok(completion) => completion,
-            Err(error) => {
-                // A credential-store failure after start must not strand a pending reply.
-                if error.code == "credential_store" || error.code == "context_limit" {
-                    if let Some(pending) = core.requests.remove(&request) {
-                        pending.token.cancel();
-                        core.store.finish(
-                            &workspace,
-                            &request,
-                            pending.generation,
-                            "error",
-                            error.message,
-                        )?;
-                    }
-                }
-                return Err(error);
-            }
-        }
-    };
-    let result = tokio::select! {
-        biased;
-        _ = completion.token.cancelled() => return Err(AppError::stale()),
-        result = provider::complete(client,&completion.base,completion.key.as_deref().map(String::as_str),completion.body) => result,
-    };
-    state
-        .lock()?
-        .apply_complete(&workspace, &request, completion.generation, result)
 }
 struct Discovery {
     base: String,
@@ -372,45 +235,114 @@ pub async fn list_models(state: &NativeState) -> AppResult<ModelList> {
     state.lock()?.finish_discovery(&discovery, result)
 }
 pub async fn check(state: &NativeState) -> AppResult<ProviderCheck> {
+    check_model(state, None).await
+}
+pub async fn check_selected_model(
+    state: &NativeState,
+    model: &str,
+    generation: u64,
+) -> AppResult<ProviderCheck> {
+    validation::model(model, false)?;
+    check_model(state, Some((model, generation))).await
+}
+pub(crate) fn model_check_failed(core: &Core) -> AppResult<()> {
+    let mut runtime = core.store.runtime_config()?;
+    runtime.state = "error".into();
+    runtime.message = Some(
+        "The model check failed. Your local Hermes library and schedule Pause remain available."
+            .into(),
+    );
+    core.store.db.execute(
+        "UPDATE runtime_config SET value=?1 WHERE id=1",
+        [crate::runtime::storage::encode(&runtime)?],
+    )?;
+    Ok(())
+}
+async fn check_model(
+    state: &NativeState,
+    selection: Option<(&str, u64)>,
+) -> AppResult<ProviderCheck> {
     let client = state.client.as_ref().map_err(Clone::clone)?;
     let (mut snapshot, key, token) = {
         let mut core = state.lock()?;
         if core.check.is_some() {
             return Err(AppError::new(
                 "busy",
-                "An AI connection check is already running.",
+                "A model connection check is already running.",
             ));
         }
         let mut provider = core.store.provider()?;
+        if selection.is_some_and(|(_, generation)| generation != provider.generation) {
+            return Err(AppError::stale());
+        }
         if provider.config.base_url.is_empty() {
             return Err(AppError::new(
                 "provider_not_ready",
-                "Enter your provider endpoint before checking the connection.",
+                "Enter your model provider endpoint before checking.",
             ));
         }
         let key = core.key(&provider)?;
         provider.config.verified = false;
         provider.config.last_checked_at = None;
         core.store.set_provider(&provider)?;
+        let mut runtime = core.store.runtime_config()?;
+        runtime.state = "needsModel".into();
+        runtime.message = Some("Checking the approved model connection.".into());
+        core.store.db.execute(
+            "UPDATE runtime_config SET value=?1 WHERE id=1",
+            [crate::runtime::storage::encode(&runtime)?],
+        )?;
         let token = CancellationToken::new();
         core.check = Some(token.clone());
         (provider, key, token)
     };
-    let result = tokio::select! {
-        biased;
-        _ = token.cancelled() => return Err(AppError::stale()),
-        result = provider::check(client,&snapshot.config.base_url,key.as_deref().map(String::as_str)) => result,
+    let result = tokio::select! { biased; _ = token.cancelled() => return Err(AppError::stale()),
+    result = provider::check(client,&snapshot.config.base_url,key.as_deref().map(String::as_str)) => result };
+    let models = {
+        let mut core = state.lock()?;
+        if token.is_cancelled() || core.store.provider()?.generation != snapshot.generation {
+            return Err(AppError::stale());
+        }
+        core.check = None;
+        let models = match result {
+            Ok(models) => models,
+            Err(error) => {
+                model_check_failed(&core)?;
+                return Err(error);
+            }
+        };
+        let chosen = selection
+            .map(|(model, _)| model)
+            .unwrap_or(&snapshot.config.model);
+        let chosen = match provider::selected_model(chosen, &models) {
+            Ok(chosen) => chosen.to_owned(),
+            Err(error) => {
+                model_check_failed(&core)?;
+                return Err(error);
+            }
+        };
+        // The workspace picker verifies its selection without rewriting app-wide defaults.
+        if selection.is_none() {
+            snapshot.config.model = chosen;
+        }
+        snapshot.config.verified = true;
+        snapshot.config.last_checked_at = Some(now());
+        core.store.set_provider(&snapshot)?;
+        models
     };
-    let mut core = state.lock()?;
-    if token.is_cancelled() || core.store.provider()?.generation != snapshot.generation {
+    if let Err(error) =
+        crate::runtime::managed::sync_model(state, Some((snapshot.generation, models.clone())))
+            .await
+    {
+        let core = state.lock()?;
+        if core.store.provider()?.generation == snapshot.generation {
+            model_check_failed(&core)?;
+        }
+        return Err(error);
+    }
+    if token.is_cancelled() || state.lock()?.store.provider()?.generation != snapshot.generation {
         return Err(AppError::stale());
     }
-    core.check = None;
-    let models = result?;
-    snapshot.config.model = provider::selected_model(&snapshot.config.model, &models)?.to_owned();
-    snapshot.config.verified = true;
-    snapshot.config.last_checked_at = Some(now());
-    core.store.set_provider(&snapshot)?;
     Ok(ProviderCheck {
         provider: snapshot.config,
         models,
@@ -445,7 +377,6 @@ mod tests {
             Ok(())
         }
     }
-    include!("../tests/support/external_fixture.rs");
 
     fn core() -> Core {
         let core = Core::new(
@@ -467,27 +398,20 @@ mod tests {
         core
     }
     #[test]
-    fn in_flight_cancellation_and_deletion_reject_late_results() {
+    fn verified_provider_cannot_bypass_missing_owned_hermes() {
         let mut core = core();
-        let ws = core.store.create_workspace().unwrap().summary.id;
-        let req = uuid::Uuid::new_v4().to_string();
-        core.start(&ws, "hello", &req).unwrap();
-        let completion = core.begin_complete(&ws, &req).unwrap();
-        assert!(core.begin_complete(&ws, &req).is_err());
-        core.cancel(&ws, &req).unwrap();
-        assert!(completion.token.is_cancelled());
+        let id = core.store.create_workspace().unwrap().summary.id;
+        core.store.update_draft(&id, "preserve draft", 1).unwrap();
         assert!(core
-            .apply_complete(&ws, &req, 0, Ok("late".into()))
+            .start(&id, "preserve draft", &uuid::Uuid::new_v4().to_string())
             .is_err());
-        let req = uuid::Uuid::new_v4().to_string();
-        core.start(&ws, "hello", &req).unwrap();
-        let completion = core.begin_complete(&ws, &req).unwrap();
-        core.delete(&ws).unwrap();
-        assert!(completion.token.is_cancelled());
-        assert!(core
-            .apply_complete(&ws, &req, 0, Ok("late".into()))
-            .is_err());
-        assert!(core.store.summaries().unwrap().is_empty());
+        let workspace = core.store.workspace(&id).unwrap();
+        assert!(workspace.messages.is_empty());
+        assert_eq!(workspace.draft, "preserve draft");
+        assert_eq!(
+            core.store.runtime_workspace(&id).unwrap().route,
+            crate::runtime::dto::Route::Hermes
+        );
     }
     #[test]
     fn discovery_is_independent_read_only_bounded_and_stale_guarded() {
@@ -587,41 +511,5 @@ mod tests {
         assert!(!result.has_key);
         assert!(check.is_cancelled());
         assert!(!result.verified);
-    }
-    #[test]
-    fn config_edit_cancels_request_and_fixed_prompt_has_only_this_workspace() {
-        let mut core = core();
-        let ws = core.store.create_workspace().unwrap().summary.id;
-        let other = core.store.create_workspace().unwrap().summary.id;
-        core.store
-            .update_draft(&other, "private other chat", 1)
-            .unwrap();
-        let req = uuid::Uuid::new_v4().to_string();
-        core.start(&ws, "hello", &req).unwrap();
-        let completion = core.begin_complete(&ws, &req).unwrap();
-        assert_eq!(
-            completion.body["messages"][0]["content"],
-            provider::SYSTEM_PROMPT
-        );
-        assert_eq!(completion.body["messages"].as_array().unwrap().len(), 2);
-        assert_eq!(completion.body["stream"], false);
-        assert_eq!(completion.body["max_tokens"], 2048);
-        assert!(!completion.body.to_string().contains("private other chat"));
-        core.configure(ProviderInput {
-            label: String::new(),
-            base_url: "http://localhost:9220/v1".into(),
-            model: "new-model".into(),
-            api_key: None,
-            clear_key: false,
-        })
-        .unwrap();
-        assert!(completion.token.is_cancelled());
-        assert!(core
-            .apply_complete(&ws, &req, 0, Ok("late".into()))
-            .is_err());
-        assert_eq!(
-            core.store.workspace(&ws).unwrap().messages[1].status,
-            "cancelled"
-        );
     }
 }

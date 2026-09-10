@@ -70,7 +70,7 @@ impl Store {
         db.busy_timeout(std::time::Duration::from_secs(2))?;
         db.execute_batch("PRAGMA foreign_keys=ON; PRAGMA secure_delete=ON;")?;
         let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if version != 0 && version != 1 {
+        if version > 5 {
             return Err(AppError::new("storage_version", "This data was created by an unsupported Forma version. Update the app; your data has not been reset."));
         }
         let integrity: String = db.query_row("PRAGMA quick_check", [], |r| r.get(0))?;
@@ -104,9 +104,11 @@ impl Store {
         db.execute_batch(
             "PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; PRAGMA max_page_count=65536;",
         )?;
+        crate::runtime::storage::migrate(&mut db)?;
         let store = Self { db };
-        // Never resend a request from a previous process.
-        store.db.execute("UPDATE messages SET status='error',content='Interrupted when Forma closed. Send a new message to try again.' WHERE status='pending'", [])?;
+        // Direct completions cannot reconcile. Hermes admissions have durable request IDs:
+        // preserve their pending rows for explicit status reconciliation, never redispatch.
+        store.db.execute("UPDATE messages SET status='error',content='Interrupted when Forma closed. Send a new message to try again.' WHERE status='pending' AND request_id NOT IN (SELECT request_id FROM runtime_requests)", [])?;
         store.settings()?;
         Ok(store)
     }
@@ -233,6 +235,15 @@ impl Store {
     pub fn delete(&mut self, id: &str) -> AppResult<()> {
         validation::id(id)?;
         let tx = self.db.transaction()?;
+        tx.execute("DELETE FROM runtime_requests WHERE workspace_id=?1", [id])?;
+        tx.execute(
+            "DELETE FROM runtime_legacy_requests WHERE workspace_id=?1",
+            [id],
+        )?;
+        tx.execute(
+            "DELETE FROM runtime_legacy_owners WHERE workspace_id=?1",
+            [id],
+        )?;
         let changed = tx.execute("DELETE FROM workspaces WHERE id=?1", [id])?;
         if changed == 0 {
             return Err(AppError::missing());
@@ -246,6 +257,16 @@ impl Store {
         content: &str,
         request: &str,
         generation: u64,
+    ) -> AppResult<()> {
+        self.start_captured(workspace, content, request, generation, None)
+    }
+    pub fn start_captured(
+        &mut self,
+        workspace: &str,
+        content: &str,
+        request: &str,
+        generation: u64,
+        runtime: Option<&crate::runtime::storage::StoredRequest>,
     ) -> AppResult<()> {
         validation::id(request)?;
         validation::text(content, validation::MAX_TEXT, false)?;
@@ -284,6 +305,16 @@ impl Store {
             ));
         }
         tx.execute("INSERT INTO request_ids VALUES(?1)", [request])?;
+        if let Some(runtime) = runtime {
+            tx.execute(
+                "INSERT INTO runtime_requests VALUES(?1,?2,?3)",
+                params![
+                    request,
+                    workspace,
+                    crate::runtime::storage::encode(runtime)?
+                ],
+            )?;
+        }
         let timestamp = now();
         for (role, text, status) in [("user", content, "complete"), ("assistant", "", "pending")] {
             tx.execute("INSERT INTO messages(id,workspace_id,role,content,status,created_at,request_id,generation) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)", params![uuid::Uuid::new_v4().to_string(),workspace,role,text,status,timestamp,request,generation])?;
@@ -326,7 +357,7 @@ impl Store {
                 provider.credential
             ],
         )?;
-        tx.execute("UPDATE messages SET status='cancelled',content='Reply cancelled because the AI connection changed.' WHERE status='pending'", [])?;
+        tx.execute("UPDATE messages SET status='cancelled',content='Reply cancelled because the AI connection changed.' WHERE status='pending' AND request_id NOT IN (SELECT request_id FROM runtime_requests)", [])?;
         tx.commit()?;
         Ok(())
     }

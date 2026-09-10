@@ -40,6 +40,7 @@ struct Pending {
 pub struct Lifecycle {
     pub revision: u64,
     pub attempt: Option<AttemptStatus>,
+    pub(super) grants: super::grants::Grants,
     pending: Option<Pending>,
     refreshes: HashMap<String, String>,
 }
@@ -209,6 +210,7 @@ impl Lifecycle {
     }
 
     pub fn disconnect(&mut self, id: &str) {
+        self.grants.revoke_connection(id);
         self.refreshes.remove(id);
         self.revision += 1;
     }

@@ -1,0 +1,394 @@
+{
+  "fixtureKind": "synthetic-contract-no-Hermes-execution",
+  "capabilities": {
+    "contractVersion": "forma-runtime-v1",
+    "deviceId": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+    "libraryId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    "modelOrigin": "http://127.0.0.1:12345",
+    "runtime": {
+      "kind": "hermes",
+      "ready": false,
+      "revision": "349e6611a1c5d846a865368dd6c386b78edd1a54",
+      "reason": "not_configured"
+    },
+    "features": {
+      "eventPolling": true,
+      "interfaces": true,
+      "schedules": true,
+      "nativeToolBridge": true,
+      "generatedCodeExecution": false,
+      "liveGoogle": false
+    },
+    "tools": [
+      {
+        "name": "forma_interface_list",
+        "available": false,
+        "execution": "runtime"
+      },
+      {
+        "name": "forma_interface_get",
+        "available": false,
+        "execution": "runtime"
+      },
+      {
+        "name": "forma_interface_propose",
+        "available": false,
+        "execution": "runtime"
+      },
+      {
+        "name": "forma_schedule_create",
+        "available": false,
+        "execution": "runtime"
+      },
+      {
+        "name": "forma_gmail_list_metadata",
+        "available": false,
+        "execution": "nativeDevice",
+        "reason": "explicit_synthetic_grant_required"
+      },
+      {
+        "name": "forma_calendar_list_events",
+        "available": false,
+        "execution": "nativeDevice",
+        "reason": "explicit_synthetic_grant_required"
+      }
+    ],
+    "limits": {
+      "maxIterations": 8,
+      "maxToolCalls": 12,
+      "maxOutputTokens": 4096,
+      "maxDurationSeconds": 180,
+      "maxToolResultBytes": 262144,
+      "dailyModelRequests": 192,
+      "maxQueuedRuns": 8
+    }
+  },
+  "models": {
+    "items": [
+      {
+        "id": "synthetic-model",
+        "name": "Synthetic contract fixture",
+        "available": true
+      }
+    ]
+  },
+  "runAccepted": {
+    "id": "079e0e86-17ae-4a30-9672-9a70f5dafdbf",
+    "workspaceId": "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+    "origin": "operator",
+    "state": "queued",
+    "modelId": "synthetic-model",
+    "hermesRevision": "349e6611a1c5d846a865368dd6c386b78edd1a54",
+    "budgets": {
+      "maxIterations": 8,
+      "maxToolCalls": 12,
+      "maxOutputTokens": 4096,
+      "maxDurationSeconds": 180
+    },
+    "createdAt": "2026-09-10T11:05:32.418Z",
+    "lastSeq": 1
+  },
+  "proposalDetail": {
+    "createdAt": "2026-09-10T11:05:32.418Z",
+    "expectedRevision": 0,
+    "id": "96c1cd4d-f799-4dfe-bf2a-748986ed981f",
+    "sourceRunId": "079e0e86-17ae-4a30-9672-9a70f5dafdbf",
+    "spec": {
+      "datasets": [],
+      "kind": "components",
+      "root": {
+        "children": [
+          {
+            "id": "note",
+            "text": "Synthetic DTO fixture, not live account data.",
+            "type": "text"
+          }
+        ],
+        "id": "root",
+        "type": "stack"
+      },
+      "schemaVersion": 1
+    },
+    "state": "pending",
+    "title": "Synthetic interface",
+    "workspaceId": "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+  },
+  "proposalsPage": {
+    "items": [
+      {
+        "createdAt": "2026-09-10T11:05:32.418Z",
+        "expectedRevision": 0,
+        "id": "96c1cd4d-f799-4dfe-bf2a-748986ed981f",
+        "sourceRunId": "079e0e86-17ae-4a30-9672-9a70f5dafdbf",
+        "state": "pending",
+        "title": "Synthetic interface",
+        "workspaceId": "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+      }
+    ],
+    "hasMore": false
+  },
+  "interfaceDetail": {
+    "id": "23cae7eb-4b2f-415f-9204-e70015ba8285",
+    "libraryId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    "revision": 1,
+    "title": "Synthetic interface",
+    "spec": {
+      "datasets": [],
+      "kind": "components",
+      "root": {
+        "children": [
+          {
+            "id": "note",
+            "text": "Synthetic DTO fixture, not live account data.",
+            "type": "text"
+          }
+        ],
+        "id": "root",
+        "type": "stack"
+      },
+      "schemaVersion": 1
+    },
+    "createdAt": "2026-09-10T11:05:32.418Z",
+    "updatedAt": "2026-09-10T11:05:32.418Z",
+    "provenance": {
+      "dataMode": "nonAccount",
+      "sourceRunId": "079e0e86-17ae-4a30-9672-9a70f5dafdbf"
+    }
+  },
+  "interfacesPage": {
+    "items": [
+      {
+        "createdAt": "2026-09-10T11:05:32.418Z",
+        "id": "23cae7eb-4b2f-415f-9204-e70015ba8285",
+        "libraryId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        "provenance": {
+          "dataMode": "nonAccount",
+          "sourceRunId": "079e0e86-17ae-4a30-9672-9a70f5dafdbf"
+        },
+        "revision": 1,
+        "title": "Synthetic interface",
+        "updatedAt": "2026-09-10T11:05:32.418Z"
+      }
+    ],
+    "hasMore": false
+  },
+  "revisionsPage": {
+    "items": [
+      {
+        "createdAt": "2026-09-10T11:05:32.418Z",
+        "interfaceId": "23cae7eb-4b2f-415f-9204-e70015ba8285",
+        "revision": 1,
+        "title": "Synthetic interface"
+      }
+    ],
+    "hasMore": false
+  },
+  "revisionDetail": {
+    "createdAt": "2026-09-10T11:05:32.418Z",
+    "interfaceId": "23cae7eb-4b2f-415f-9204-e70015ba8285",
+    "revision": 1,
+    "spec": {
+      "datasets": [],
+      "kind": "components",
+      "root": {
+        "children": [
+          {
+            "id": "note",
+            "text": "Synthetic DTO fixture, not live account data.",
+            "type": "text"
+          }
+        ],
+        "id": "root",
+        "type": "stack"
+      },
+      "schemaVersion": 1
+    },
+    "title": "Synthetic interface"
+  },
+  "runPoll": {
+    "run": {
+      "budgets": {
+        "maxDurationSeconds": 180,
+        "maxIterations": 8,
+        "maxOutputTokens": 4096,
+        "maxToolCalls": 12
+      },
+      "createdAt": "2026-09-10T11:05:32.418Z",
+      "finalMessage": "Synthetic final",
+      "finishedAt": "2026-09-10T11:05:32.418Z",
+      "hermesRevision": "349e6611a1c5d846a865368dd6c386b78edd1a54",
+      "id": "079e0e86-17ae-4a30-9672-9a70f5dafdbf",
+      "lastSeq": 6,
+      "modelId": "synthetic-model",
+      "origin": "operator",
+      "startedAt": "2026-09-10T11:05:32.418Z",
+      "state": "succeeded",
+      "workspaceId": "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+    },
+    "events": [
+      {
+        "at": "2026-09-10T11:05:32.418Z",
+        "payload": {
+          "state": "queued"
+        },
+        "runId": "079e0e86-17ae-4a30-9672-9a70f5dafdbf",
+        "seq": 1,
+        "type": "run.state"
+      },
+      {
+        "at": "2026-09-10T11:05:32.418Z",
+        "payload": {
+          "state": "running"
+        },
+        "runId": "079e0e86-17ae-4a30-9672-9a70f5dafdbf",
+        "seq": 2,
+        "type": "run.state"
+      },
+      {
+        "at": "2026-09-10T11:05:32.418Z",
+        "payload": {
+          "expectedRevision": 0,
+          "proposalId": "96c1cd4d-f799-4dfe-bf2a-748986ed981f"
+        },
+        "runId": "079e0e86-17ae-4a30-9672-9a70f5dafdbf",
+        "seq": 3,
+        "type": "interface.proposed"
+      },
+      {
+        "at": "2026-09-10T11:05:32.418Z",
+        "payload": {
+          "text": "Synthetic final"
+        },
+        "runId": "079e0e86-17ae-4a30-9672-9a70f5dafdbf",
+        "seq": 4,
+        "type": "assistant.message"
+      },
+      {
+        "at": "2026-09-10T11:05:32.418Z",
+        "payload": {
+          "state": "succeeded"
+        },
+        "runId": "079e0e86-17ae-4a30-9672-9a70f5dafdbf",
+        "seq": 5,
+        "type": "run.state"
+      },
+      {
+        "at": "2026-09-10T11:05:32.418Z",
+        "payload": {
+          "interfaceId": "23cae7eb-4b2f-415f-9204-e70015ba8285",
+          "revision": 1
+        },
+        "runId": "079e0e86-17ae-4a30-9672-9a70f5dafdbf",
+        "seq": 6,
+        "type": "interface.updated"
+      }
+    ],
+    "nextAfter": 6,
+    "hasMore": false,
+    "toolRequests": []
+  },
+  "runsPage": {
+    "items": [
+      {
+        "budgets": {
+          "maxDurationSeconds": 180,
+          "maxIterations": 8,
+          "maxOutputTokens": 4096,
+          "maxToolCalls": 12
+        },
+        "createdAt": "2026-09-10T11:05:32.418Z",
+        "finishedAt": "2026-09-10T11:05:32.418Z",
+        "hermesRevision": "349e6611a1c5d846a865368dd6c386b78edd1a54",
+        "id": "079e0e86-17ae-4a30-9672-9a70f5dafdbf",
+        "lastSeq": 6,
+        "modelId": "synthetic-model",
+        "origin": "operator",
+        "startedAt": "2026-09-10T11:05:32.418Z",
+        "state": "succeeded",
+        "workspaceId": "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+      }
+    ],
+    "hasMore": false
+  },
+  "scheduleDetail": {
+    "workspaceId": "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+    "interfaceId": "23cae7eb-4b2f-415f-9204-e70015ba8285",
+    "prompt": "Synthetic paused request",
+    "modelId": "synthetic-model",
+    "cron": "0 9 * * *",
+    "timezone": "UTC",
+    "endAt": "2026-09-11T11:05:32.419Z",
+    "maxRuns": 2,
+    "budgets": {
+      "maxIterations": 8,
+      "maxToolCalls": 12,
+      "maxOutputTokens": 4096,
+      "maxDurationSeconds": 180
+    },
+    "grantRefs": [],
+    "id": "681b8d49-4fa5-4e7f-ad12-38d8dd7e42fd",
+    "version": 1,
+    "state": "paused",
+    "runsStarted": 0,
+    "interfaceRevisionPolicy": "latestAtRunStart",
+    "createdAt": "2026-09-10T11:05:32.419Z",
+    "updatedAt": "2026-09-10T11:05:32.419Z"
+  },
+  "schedulesPage": {
+    "items": [
+      {
+        "budgets": {
+          "maxDurationSeconds": 180,
+          "maxIterations": 8,
+          "maxOutputTokens": 4096,
+          "maxToolCalls": 12
+        },
+        "createdAt": "2026-09-10T11:05:32.419Z",
+        "cron": "0 9 * * *",
+        "endAt": "2026-09-11T11:05:32.419Z",
+        "grantRefs": [],
+        "id": "681b8d49-4fa5-4e7f-ad12-38d8dd7e42fd",
+        "interfaceId": "23cae7eb-4b2f-415f-9204-e70015ba8285",
+        "interfaceRevisionPolicy": "latestAtRunStart",
+        "maxRuns": 2,
+        "modelId": "synthetic-model",
+        "runsStarted": 0,
+        "state": "paused",
+        "timezone": "UTC",
+        "updatedAt": "2026-09-10T11:05:32.419Z",
+        "version": 1,
+        "workspaceId": "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+      }
+    ],
+    "hasMore": false
+  },
+  "cancelKnown": {
+    "id": "079e0e86-17ae-4a30-9672-9a70f5dafdbf",
+    "state": "succeeded",
+    "admitted": true,
+    "run": {
+      "budgets": {
+        "maxDurationSeconds": 180,
+        "maxIterations": 8,
+        "maxOutputTokens": 4096,
+        "maxToolCalls": 12
+      },
+      "createdAt": "2026-09-10T11:05:32.418Z",
+      "finalMessage": "Synthetic final",
+      "finishedAt": "2026-09-10T11:05:32.418Z",
+      "hermesRevision": "349e6611a1c5d846a865368dd6c386b78edd1a54",
+      "id": "079e0e86-17ae-4a30-9672-9a70f5dafdbf",
+      "lastSeq": 6,
+      "modelId": "synthetic-model",
+      "origin": "operator",
+      "startedAt": "2026-09-10T11:05:32.418Z",
+      "state": "succeeded",
+      "workspaceId": "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+    }
+  },
+  "cancelMissing": {
+    "id": "28a51cb5-4557-40f0-8b9d-5c827d86e5fd",
+    "state": "cancelled",
+    "admitted": false
+  }
+}

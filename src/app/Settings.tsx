@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { ArrowRight, ArrowSquareOut, Check, CheckCircle, EnvelopeSimple, GearSix, GoogleLogo, LockSimple, Sparkle, X } from '@phosphor-icons/react';
+import { AccountGrantStatus, RuntimeSettings } from './RuntimeSettings';
 import type { AppSettings } from './contracts';
 import type { AppStore } from './store';
 import { friendlyError } from './bridge';
@@ -121,7 +122,7 @@ function ProviderSetup({ store, settings, onBusyChange }: { store: AppStore; set
   };
   return (
     <details className="advanced-settings">
-      <summary><GearSix size={18} /><span>Advanced AI setup</span><span className="disclosure-hint">Custom connection</span></summary>
+      <summary><GearSix size={18} /><span>Model gateway setup</span><span className="disclosure-hint">Custom connection</span></summary>
       <form className="provider-form" onSubmit={event => { event.preventDefault(); void submit(); }}>
         <p className="field-note">Use an OpenAI-compatible connection you trust. Sending shares this chat’s messages with that connection.</p>
         {state.anyReplyPending && <p className="field-note">Finish or stop active replies before changing the connection.</p>}
@@ -151,6 +152,7 @@ export function Settings({ store, settings, browser, onClose }: { store: AppStor
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [name, setName] = useState(settings.displayName);
+  const state = useSyncExternalStore(store.subscribe, store.getSnapshot);
   const save = async (patch: Parameters<AppStore['saveSettings']>[0]) => {
     setBusy(true); setError(null);
     try { await store.saveSettings(patch); } catch (failure) { setError(friendlyError(failure)); }
@@ -169,10 +171,12 @@ export function Settings({ store, settings, browser, onClose }: { store: AppStor
     </section>
     <section className="settings-section"><h3>Accounts</h3><Accounts browser={browser} /></section>
     <section className="settings-section">
-      <div className="section-heading"><h3>AI connection</h3><span className="availability">{settings.provider.verified ? 'Checked' : settings.provider.baseUrl ? 'Needs a check' : 'Not set up'}</span></div>
+      <div className="section-heading"><h3>Model & provider</h3><span className="availability">{settings.provider.verified ? 'Checked' : settings.provider.baseUrl ? 'Needs a check' : 'Not set up'}</span></div>
       {!store.bridge.native && <p className="browser-note"><LockSimple size={18} /><span>This browser preview saves chats and drafts locally. AI connections and secure keys are available in the desktop app.</span></p>}
       <ProviderSetup store={store} settings={settings} onBusyChange={setBusy} />
     </section>
+    <RuntimeSettings store={store} />
+    <AccountGrantStatus native={store.bridge.native} workspaceId={state.activeId} runtimeOrigin={store.bridge.native ? 'Forma-managed Hermes on this desktop' : undefined} modelOrigin={state.runtime?.capabilities?.modelOrigin} />
     <p className="settings-footnote">Chats are remembered automatically on this device. Deleting a workspace removes its chat and draft.</p>
     {error && <InlineError>{error}</InlineError>}
     <div className="modal-actions"><button type="button" className="button primary" disabled={busy} onClick={onClose}>Done</button></div>
@@ -204,7 +208,7 @@ export function Onboarding({ store, settings, browser, onSettings }: { store: Ap
       {step === 2 && <div className="onboarding-copy start-step">
         <span className="step-symbol"><Sparkle size={29} /></span><h1 id="onboarding-title">Anything else to add?</h1><p>You can add more services now or come back from Settings.</p><button type="button" className="button secondary" disabled={busy || browser.busy} onClick={() => { void advance(1); }}>Add another service <ArrowRight size={16} /></button>
         <div className="readiness-card"><Check size={20} /><span>Local chats & drafts<span className="row-detail">Ready whenever you are</span></span></div>
-        <div className="readiness-card"><GearSix size={20} /><span>AI connection<span className="row-detail">{settings.provider.verified ? 'Checked and ready' : 'Set up when you’re ready to send'}</span></span>
+        <div className="readiness-card"><GearSix size={20} /><span>Model provider<span className="row-detail">{settings.provider.verified ? 'Provider checked · Hermes status is in Settings' : 'Set up when you’re ready to send'}</span></span>
           {!settings.provider.verified && <button className="text-button" type="button" onClick={onSettings}>Settings <ArrowRight size={14} /></button>}</div>
       </div>}
       {error && <InlineError>{error}</InlineError>}

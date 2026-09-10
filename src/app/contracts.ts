@@ -73,6 +73,13 @@ export interface ModelList {
 
 export interface AppBridge {
   readonly native: boolean;
+  runtimeStatus?(): Promise<import('./runtime-contracts').RuntimeStatus>;
+  runtimeWorkspace?(workspaceId: string): Promise<import('./runtime-contracts').RuntimeWorkspace>;
+  runtimeRetry?(): Promise<import('./runtime-contracts').RuntimeStatus>;
+  finishWindowClose?(): Promise<'hidden' | 'closed'>;
+  runtimeSelectModel?(workspaceId: string, model: string): Promise<import('./runtime-contracts').RuntimeWorkspace>;
+  runtimeCheck?(): Promise<import('./runtime-contracts').RuntimeStatus>;
+  runtimeProgress?(workspaceId: string, requestId: string): Promise<import('./runtime-contracts').RuntimeProgress>;
   bootstrap(): Promise<Bootstrap>;
   saveSettings(input: SettingsInput): Promise<AppSettings>;
   configureProvider(input: ProviderInput): Promise<ProviderConfig>;

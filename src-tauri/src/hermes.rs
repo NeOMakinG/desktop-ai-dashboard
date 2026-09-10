@@ -125,7 +125,7 @@ pub fn canonical_reply(raw: &str, forbidden: Option<&str>) -> Option<String> {
 // bounded input also covers unclosed strings, trailing content, overwritten keys
 // and escaped prose without trusting JSON structure or parsing numeric tokens.
 // Invalid escapes remain literal; delimiters stay present, never joining fields.
-fn escaped_contains(raw: &str, needle: &str) -> bool {
+pub(crate) fn escaped_contains(raw: &str, needle: &str) -> bool {
     let mut decoded = Zeroizing::new(String::with_capacity(raw.len()));
     let mut index = 0;
     while index < raw.len() {

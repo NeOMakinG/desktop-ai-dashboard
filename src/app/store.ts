@@ -1,5 +1,6 @@
 import type { AppBridge, AppSettings, ChatWorkspace, ProviderInput, SettingsInput, WorkspaceSummary } from './contracts';
 import { AppError, friendlyError, summaryOf } from './bridge.ts';
+import type { RuntimeStatus, RuntimeWorkspace, RuntimeProgress } from './runtime-contracts';
 
 const ACTIVE_KEY = 'forma.active-workspace.v1';
 interface ActiveRequest {
@@ -27,6 +28,9 @@ interface Entry {
   request?: ActiveRequest;
 }
 export interface AppSnapshot {
+  runtime: RuntimeStatus | null;
+  runtimeWorkspace: RuntimeWorkspace | null;
+  runtimeProgress: RuntimeProgress | null;
   ready: boolean;
   loading: boolean;
   error: string | null;
@@ -65,7 +69,9 @@ export class AppStore {
   private generation = 0;
   private catalogRevision = 0;
   private modelRefresh?: Promise<void>;
+  private runtimeRevision = 0;
   private snapshot: AppSnapshot = {
+    runtime: null, runtimeWorkspace: null, runtimeProgress: null,
     ready: false, loading: false, error: null, settings: null, workspaces: [], activeId: null,
     workspace: null, draft: '', dirty: false, saving: false, draftError: null, replyError: null,
     pending: false, starting: false, navigating: false, closing: false,
@@ -75,6 +81,61 @@ export class AppStore {
   constructor(readonly bridge: AppBridge) {}
   subscribe = (listener: () => void) => { this.listeners.add(listener); return () => { this.listeners.delete(listener); }; };
   getSnapshot = () => this.snapshot;
+
+  refreshRuntime = async () => {
+    if (!this.bridge.runtimeStatus || !this.bridge.runtimeWorkspace) return;
+    const revision = ++this.runtimeRevision;
+    const id = this.snapshot.activeId;
+    try {
+      const [runtime, runtimeWorkspace] = await Promise.all([this.bridge.runtimeStatus(), id ? this.bridge.runtimeWorkspace(id) : Promise.resolve(null)]);
+      if (revision !== this.runtimeRevision || id !== this.snapshot.activeId || (id && this.deleted.has(id))) return;
+      const progress = this.snapshot.runtimeProgress;
+      this.emit({ runtime, runtimeWorkspace, runtimeProgress: progress?.generation === runtime.generation && progress.workspaceId === id ? progress : null });
+    } catch (error) {
+      if (revision === this.runtimeRevision && id === this.snapshot.activeId) this.emit({ runtime: null, runtimeWorkspace: null, runtimeProgress: null });
+      throw error;
+    }
+  };
+  retryRuntime = async (): Promise<boolean> => {
+    this.providerGuard();
+    if (!this.bridge.runtimeRetry) throw new AppError('runtime_not_ready', 'Desktop Hermes is unavailable.');
+    this.emit({ providerBusy: true });
+    try { await this.bridge.runtimeRetry(); await this.refreshRuntime(); return this.snapshot.runtime?.state === 'ready'; }
+    finally { this.emit({ providerBusy: false }); }
+  };
+  checkRuntime = async (): Promise<boolean> => { await this.checkProvider(); return this.snapshot.runtime?.state === 'ready'; };
+  private watchRuntime(entry: Entry, request: ActiveRequest) {
+    if (!this.bridge.runtimeProgress) return { stop: () => {}, refresh: async () => {} };
+    let stopped = false;
+    let busy = false;
+    const update = async () => {
+      if (busy || stopped) return;
+      busy = true;
+      try {
+        const progress = await this.bridge.runtimeProgress!(entry.data.id, request.id);
+        if (!stopped && !request.cancelled && !entry.blocked && !this.deleted.has(entry.data.id) && entry.request === request && this.snapshot.activeId === entry.data.id && this.snapshot.runtime?.generation === progress.generation) this.emit({ runtimeProgress: progress });
+      } catch { /* Progress is observational; complete/cancel owns visible transport errors. */ }
+      finally { busy = false; }
+    };
+    const timer = setInterval(() => { void update(); }, 750);
+    void update();
+    return { stop: () => { stopped = true; clearInterval(timer); }, refresh: update };
+  }
+  resumeRuntimeReply = async () => {
+    const id = this.snapshot.activeId;
+    const entry = id ? this.entries.get(id) : undefined;
+    const pending = entry?.data.messages.find(message => message.status === 'pending' && message.requestId);
+    if (!entry || !pending?.requestId || entry.request || entry.blocked || this.snapshot.closing) return;
+    const request: ActiveRequest = { id: pending.requestId, generation: this.generation, acked: true, cancelled: false };
+    entry.request = request; entry.replyError = null; this.emit();
+    const stop = this.watchRuntime(entry, request);
+    const task = (async () => {
+      try { const saved = await this.bridge.completeMessage(entry.data.id, request.id); if (!request.cancelled && entry.request === request) this.applyMessages(entry, saved); }
+      catch (error) { if (!request.cancelled && !entry.blocked) entry.replyError = friendlyError(error); }
+      finally { await stop.refresh(); stop.stop(); await this.refreshRuntime().catch(() => {}); request.finished = true; if (request.cancelTask) await request.cancelTask.catch(() => {}); if (entry.request === request && !request.cancelFailed) entry.request = undefined; this.emit(); }
+    })();
+    request.done = task; await task;
+  };
 
   private emit(patch: Partial<AppSnapshot> = {}) {
     this.snapshot = { ...this.snapshot, ...patch };
@@ -133,6 +194,7 @@ export class AppStore {
       this.rememberActive(workspace.id);
       this.emit({ ready: true, loading: false, settings: bootstrap.settings,
         workspaces: id ? bootstrap.workspaces : [summaryOf(workspace)], activeId: workspace.id });
+      await this.refreshRuntime();
     } catch (error) { this.emit({ loading: false, error: friendlyError(error) }); }
   }
 
@@ -198,7 +260,8 @@ export class AppStore {
       if (!this.entries.has(id)) this.entries.set(id, this.entryFrom(await this.bridge.getWorkspace(id)));
       if (this.deleted.has(id)) return;
       this.rememberActive(id);
-      this.emit({ activeId: id });
+      this.emit({ activeId: id, runtimeWorkspace: null, runtimeProgress: null });
+      await this.refreshRuntime();
     } catch (error) { this.emit({ error: friendlyError(error) }); throw error; }
     finally { this.emit({ navigating: false }); }
   };
@@ -210,7 +273,8 @@ export class AppStore {
       const workspace = await this.bridge.createWorkspace();
       this.entries.set(workspace.id, this.entryFrom(workspace));
       this.rememberActive(workspace.id);
-      this.emit({ activeId: workspace.id });
+      this.emit({ activeId: workspace.id, runtimeWorkspace: null, runtimeProgress: null });
+      await this.refreshRuntime();
       this.publishSummary(workspace);
     } catch (error) { this.emit({ error: friendlyError(error) }); throw error; }
     finally { this.emit({ navigating: false }); }
@@ -245,7 +309,8 @@ export class AppStore {
         const workspace = next ? (this.entries.get(next.id)?.data ?? await this.bridge.getWorkspace(next.id)) : await this.bridge.createWorkspace();
         if (!this.entries.has(workspace.id)) this.entries.set(workspace.id, this.entryFrom(workspace));
         this.rememberActive(workspace.id);
-        this.emit({ activeId: workspace.id });
+        this.emit({ activeId: workspace.id, runtimeWorkspace: null, runtimeProgress: null });
+      await this.refreshRuntime();
         this.publishSummary(this.entries.get(workspace.id)!.data);
       }
     } catch (error) {
@@ -259,7 +324,10 @@ export class AppStore {
     const entry = this.snapshot.activeId ? this.entries.get(this.snapshot.activeId) : undefined;
     if (!entry || entry.blocked || entry.request || this.snapshot.navigating || this.snapshot.closing || !entry.draft.trim()) return;
     if (this.snapshot.providerBusy || this.snapshot.selectingModel) throw new AppError('busy', 'Connection is changing.');
-    if (!this.bridge.native || !this.snapshot.settings?.provider.verified) throw new AppError('provider_not_ready', 'Set up AI first.');
+    if (!this.bridge.native) throw new AppError('browser_unsupported', 'Desktop only.');
+    if (!this.bridge.runtimeWorkspace || this.snapshot.runtimeWorkspace?.workspaceId !== entry.data.id) throw new AppError('runtime_not_ready', 'Refresh the workspace route first.');
+    if (entry.data.messages.some(message => message.status === 'pending')) throw new AppError('runtime_unresolved', 'Reconcile the pending Hermes run before sending another message.');
+    if (!this.snapshot.runtime?.verified || !['ready', 'needsModel'].includes(this.snapshot.runtime.state) || !this.snapshot.settings?.provider.verified || !this.snapshot.runtimeWorkspace?.modelId) throw new AppError('runtime_not_ready', 'Check your model configuration first.');
     const request: ActiveRequest = { id: crypto.randomUUID(), generation: this.generation, acked: false, cancelled: false };
     entry.request = request;
     entry.replyError = null;
@@ -268,6 +336,7 @@ export class AppStore {
     request.done = task;
     await task;
   };
+  private requestCurrent(request: ActiveRequest) { return request.generation === this.generation; }
   private async runMessage(entry: Entry, request: ActiveRequest) {
     try {
       await this.flushEntry(entry);
@@ -280,23 +349,28 @@ export class AppStore {
         entry.dirty = false;
         this.applyMessages(entry, started);
       }
-      if (request.cancelled || request.generation !== this.generation || entry.blocked) {
+      if (request.cancelled || !this.requestCurrent(request) || entry.blocked) {
         await this.cancelAcknowledged(entry, request);
         return;
       }
-      const completed = await this.bridge.completeMessage(entry.data.id, request.id);
-      if (!request.cancelled && request.generation === this.generation) this.applyMessages(entry, completed);
+      await this.refreshRuntime().catch(() => {});
+      const stopProgress = this.watchRuntime(entry, request);
+      try {
+        const completed = await this.bridge.completeMessage(entry.data.id, request.id);
+        if (!request.cancelled && this.requestCurrent(request)) this.applyMessages(entry, completed);
+      } finally { await stopProgress.refresh(); stopProgress.stop(); }
     } catch (error) {
-      if (!entry.blocked && !this.deleted.has(entry.data.id) && !request.cancelled && request.generation === this.generation) {
+      if (!entry.blocked && !this.deleted.has(entry.data.id) && !request.cancelled && this.requestCurrent(request)) {
         entry.replyError = friendlyError(error);
         if (request.acked) {
           try {
             const recovered = await this.bridge.getWorkspace(entry.data.id);
-            if (!request.cancelled && request.generation === this.generation && entry.request === request) this.applyMessages(entry, recovered);
+            if (!request.cancelled && this.requestCurrent(request) && entry.request === request) this.applyMessages(entry, recovered);
           } catch { /* Retain the last acknowledged history. */ }
         }
       }
     } finally {
+      await this.refreshRuntime().catch(() => {});
       request.finished = true;
       // Do not release this workspace for a new send while an old cancel can still publish.
       if (request.cancelTask) await request.cancelTask.catch(() => {});
@@ -369,6 +443,7 @@ export class AppStore {
       if (generation !== this.generation) throw new AppError('config_changed', 'Connection changed.');
       this.providerRevision += 1;
       if (this.snapshot.settings) this.emit({ settings: { ...this.snapshot.settings, provider } });
+      await this.refreshRuntime();
       return provider;
     })().finally(() => this.emit({ providerBusy: false })));
   };
@@ -391,6 +466,7 @@ export class AppStore {
         this.providerRevision += 1;
         if (this.snapshot.settings) this.emit({ settings: { ...this.snapshot.settings, provider: result.provider },
           ...(catalogRevision === this.catalogRevision ? { models: result.models, modelsStatus: 'ready' as const, modelsError: null } : {}) });
+        await this.refreshRuntime();
         return result;
       } catch (error) {
         if (generation === this.generation && catalogRevision === this.catalogRevision) this.emit({ modelsStatus: 'error', modelsError: friendlyError(error) });
@@ -401,6 +477,15 @@ export class AppStore {
   refreshModels = (): Promise<void> => {
     try { this.providerGuard(); } catch (error) { return Promise.reject(error); }
     if (this.modelRefresh) return this.modelRefresh;
+    if (this.bridge.runtimeCheck && this.snapshot.runtime?.state === 'ready' && this.snapshot.runtime.verified) {
+      this.runtimeRevision += 1;
+      this.emit({ modelsStatus: 'loading', modelsError: null, runtime: this.snapshot.runtime ? { ...this.snapshot.runtime, verified: false } : null });
+      const task = this.bridge.runtimeCheck().then(async () => { await this.refreshRuntime(); this.emit({ modelsStatus: 'ready' }); }).catch(async error => {
+        await this.refreshRuntime().catch(() => {});
+        this.emit({ modelsStatus: 'error', modelsError: friendlyError(error) }); throw error;
+      }).finally(() => { if (this.modelRefresh === task) this.modelRefresh = undefined; });
+      this.modelRefresh = task; return task;
+    }
     const generation = this.generation;
     const revision = ++this.catalogRevision;
     const task = this.trackProvider(Promise.resolve().then(async () => {
@@ -408,6 +493,7 @@ export class AppStore {
         const result = await this.bridge.listModels();
         if (generation !== this.generation || revision !== this.catalogRevision) return;
         this.emit({ models: result.models, modelsStatus: 'ready', modelsError: null });
+        await this.refreshRuntime();
       } catch (error) {
         if (generation !== this.generation || revision !== this.catalogRevision) return;
         this.emit({ modelsStatus: 'error', modelsError: friendlyError(error) });
@@ -420,18 +506,43 @@ export class AppStore {
   };
   selectModel = async (model: string) => {
     this.providerGuard();
+    if (this.bridge.runtimeSelectModel) {
+      const id = this.snapshot.activeId;
+      if (!id || !this.bridge.runtimeSelectModel) throw new AppError('runtime_not_ready', 'Desktop runtime is unavailable.');
+      const entry = this.entries.get(id);
+      if (entry?.request || entry?.data.messages.some(message => message.status === 'pending')) throw new AppError('busy', 'Finish this workspace’s run first.');
+      this.emit({ selectingModel: true, modelSelectionError: null });
+      try {
+        const accepted = await this.bridge.runtimeSelectModel(id, model);
+        if (accepted.workspaceId !== id || accepted.modelId !== model) throw new AppError('runtime_protocol', 'Runtime selection was not accepted.');
+        if (id === this.snapshot.activeId && !this.deleted.has(id)) this.emit({ runtimeWorkspace: accepted });
+        const provider = (await this.bridge.bootstrap()).settings.provider;
+        this.providerRevision += 1;
+        if (this.snapshot.settings) this.emit({ settings: { ...this.snapshot.settings, provider } });
+        await this.refreshRuntime();
+      } catch (error) { this.emit({ modelSelectionError: friendlyError(error) }); throw error; }
+      finally { this.emit({ selectingModel: false }); }
+      return;
+    }
     if (this.snapshot.anyReplyPending) throw new AppError('busy', 'Finish active replies first.');
     const current = this.snapshot.settings?.provider;
     if (!current || !this.snapshot.models.includes(model)) throw new AppError('model_unavailable', 'Refresh available models first.');
     this.emit({ modelSelectionError: null });
     if (current.model === model && current.verified) return;
     this.emit({ selectingModel: true, modelSelectionError: null });
+    const selectionWorkspaceId = this.snapshot.activeId;
     return this.trackProvider((async () => {
       try {
         // Deliberately omit apiKey/clearKey: native retains the endpoint-bound key.
         await this.performConfigure({ label: current.label, baseUrl: current.baseUrl, model });
         const result = await this.performCheck();
         if (!result.provider.verified || result.provider.model !== model) throw new AppError('provider_not_ready', 'Selection was not verified.');
+        const id = selectionWorkspaceId;
+        if (id && !this.deleted.has(id) && this.bridge.runtimeSelectModel) {
+          const accepted = await this.bridge.runtimeSelectModel(id, model);
+          if (accepted.workspaceId !== id || accepted.modelId !== model) throw new AppError('runtime_protocol', 'Runtime selection was not accepted.');
+          if (id === this.snapshot.activeId && !this.deleted.has(id)) this.emit({ runtimeWorkspace: accepted });
+        }
       } catch (error) {
         this.emit({ modelSelectionError: friendlyError(error) });
         throw error;
@@ -467,5 +578,6 @@ export class AppStore {
       throw error;
     }
   };
+  resumeAfterClose = () => this.emit({ closing: false });
   closeFailed = () => this.emit({ closing: false, error: 'This window could not close safely. Your work is still open.' });
 }

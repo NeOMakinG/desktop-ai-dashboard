@@ -35,9 +35,15 @@ const settings = (): AppSettings => ({
 });
 
 /** In-memory transport only. It performs no provider, native, or network calls. */
-class ControlledBridge implements AppBridge {
+export class ControlledBridge implements AppBridge {
   readonly native = true;
   settings = settings();
+  runtimeStatus = async (): Promise<import('./runtime-contracts').RuntimeStatus> => ({ state: 'ready', message: null, verified: true, generation: 1,
+    models: this.models.map(id => ({ id, name: id, available: true })), capabilities: { contractVersion: 'forma-runtime-v1', deviceId: 'fixture-device', libraryId: 'fixture-library', modelOrigin: this.settings.provider.baseUrl,
+    runtime: { kind: 'hermes', ready: true, revision: '349e6611a1c5d846a865368dd6c386b78edd1a54' }, features: { eventPolling: true, interfaces: true, schedules: true, nativeToolBridge: false, generatedCodeExecution: false, liveGoogle: false }, tools: [],
+    limits: { maxIterations: 8, maxToolCalls: 12, maxOutputTokens: 4096, maxDurationSeconds: 180, maxToolResultBytes: 262144 } } });
+  runtimeWorkspace = async (workspaceId: string): Promise<import('./runtime-contracts').RuntimeWorkspace> => ({ workspaceId, route: 'hermes', modelId: this.settings.provider.model, generation: 1, remoteInitialized: false });
+
   workspaces = new Map<string, ChatWorkspace>();
   completion = deferred<ChatWorkspace>();
   cancellation = deferred<ChatWorkspace>();

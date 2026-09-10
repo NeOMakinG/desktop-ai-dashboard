@@ -21,6 +21,19 @@ export class AppError extends Error {
 
 export function friendlyError(error: unknown): string {
   const code = error && typeof error === 'object' && 'code' in error ? String(error.code).toLowerCase() : '';
+  if (code.startsWith('runtime_')) {
+    if (code === 'runtime_assets') return 'Bundled Hermes files are missing or invalid. Rebuild or reinstall Forma. Your chats are unchanged.';
+    if (code === 'runtime_platform') return 'Managed Hermes is not supported on this platform yet. No fallback was used.';
+    if (code === 'runtime_close') return 'Forma cannot confirm safe background operation. Keep this window open or explicitly Quit Forma.';
+    if (code === 'runtime_conflict') return 'This runtime object changed, or work is still pending. Refresh it before retrying; your last valid view is unchanged.';
+    if (code === 'runtime_not_found' || code === 'runtime_deleted') return 'This runtime object is unavailable or was deleted. Refresh the library.';
+    if (code === 'runtime_auth') return 'Hermes denied this device or operation. Check its grants.';
+    if (code === 'runtime_unresolved' || code === 'runtime_network') return 'The Hermes run is unresolved. Use Reconcile or Stop; sending again could create separate work.';
+    if (code === 'runtime_not_ready') return 'Hermes is not ready. Check your model configuration or retry starting Hermes.';
+    if (code === 'runtime_limit') return 'This runtime view exceeds the bounded item or data limit. It was not silently truncated.';
+    if (code === 'runtime_binding_changed') return 'The managed Hermes profile identity changed. Existing work is preserved; retry or repair the app.';
+    return 'The dedicated runtime returned an unsupported response. Your last valid work is preserved; no direct fallback was used.';
+  }
   if (code.includes('corrupt') || code.includes('schema') || code.includes('storage_format')) {
     return 'Your saved work could not be opened. It has not been replaced. Try reopening Forma, or restore a backup.';
   }
@@ -159,6 +172,13 @@ export class BrowserBridge implements AppBridge {
 
 export class NativeBridge implements AppBridge {
   readonly native = true;
+  runtimeStatus = () => invoke<import('./runtime-contracts').RuntimeStatus>('runtime_status');
+  runtimeWorkspace = (workspaceId: string) => invoke<import('./runtime-contracts').RuntimeWorkspace>('runtime_workspace', { workspaceId });
+  runtimeRetry = () => invoke<import('./runtime-contracts').RuntimeStatus>('runtime_retry');
+  finishWindowClose = () => invoke<'hidden' | 'closed'>('finish_window_close');
+  runtimeSelectModel = (workspaceId: string, model: string) => invoke<import('./runtime-contracts').RuntimeWorkspace>('runtime_select_model', { workspaceId, model });
+  runtimeCheck = () => invoke<import('./runtime-contracts').RuntimeStatus>('runtime_check');
+  runtimeProgress = (workspaceId: string, requestId: string) => invoke<import('./runtime-contracts').RuntimeProgress>('runtime_progress', { workspaceId, requestId });
   bootstrap = () => invoke<Bootstrap>('app_bootstrap');
   saveSettings = (input: SettingsInput) => invoke<AppSettings>('save_settings', { input });
   configureProvider = (input: ProviderInput) => invoke<ProviderConfig>('configure_provider', { input });

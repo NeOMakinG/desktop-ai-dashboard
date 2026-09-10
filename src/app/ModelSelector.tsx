@@ -14,19 +14,29 @@ export function filterModels(models: string[], query: string): string[] {
   return models.filter(id => `${modelLabel(id)} ${id}`.toLocaleLowerCase().includes(needle));
 }
 
+function selectionContext(state: AppSnapshot) {
+  const workspace = state.runtimeWorkspace;
+  if (workspace && workspace.workspaceId !== state.activeId) return { available: false, model: '', verified: false };
+  return { available: !!state.runtime?.verified || !!state.settings?.provider.baseUrl, model: workspace?.modelId || state.settings?.provider.model || '', verified: workspace ? !!state.runtime?.verified : !!state.settings?.provider.verified };
+}
+function availableModels(state: AppSnapshot) {
+  const accepted = (state.runtime?.models || []).filter(model => model.available).map(model => model.id);
+  return state.runtime?.state === 'ready' && state.runtime.verified ? accepted : state.models;
+}
+
 export function ModelSelector({ state, store, onSettings }: { state: AppSnapshot; store: AppStore; onSettings: () => void }) {
   const [open, setOpen] = useState(false);
-  const current = state.settings?.provider;
+  const current = selectionContext(state);
   const blocked = state.anyReplyPending || state.providerBusy || state.selectingModel || state.closing;
   const show = () => {
     setOpen(true);
-    if (store.bridge.native && current?.baseUrl && state.modelsStatus === 'idle') void store.refreshModels().catch(() => {});
+    if (store.bridge.native && current?.available && state.modelsStatus === 'idle') void store.refreshModels().catch(() => {});
   };
   return <>
     <button type="button" className="model-chip" aria-haspopup="dialog" aria-expanded={open}
       aria-label={`Choose model, current: ${current?.model ? modelLabel(current.model) : 'not selected'}${current?.model && !current.verified ? ', needs a check' : ''}`}
       title={state.anyReplyPending ? 'Finish or stop active replies to change models' : current?.model || 'Choose a model'} disabled={blocked} onClick={show}>
-      <span>{state.selectingModel ? 'Checking model…' : modelLabel(current?.model ?? '')}</span>
+      <span>{`${modelLabel(current?.model ?? '')}${state.selectingModel ? ' · Applying model…' : ''}`}</span>
       {current?.model && !current.verified && <span className="model-chip-note">Unchecked</span>}<CaretDown size={12} />
     </button>
     {open && <ModelPicker state={state} store={store} onClose={() => setOpen(false)} onSettings={() => { setOpen(false); onSettings(); }} />}
@@ -38,9 +48,10 @@ export function ModelPicker({ state, store, onClose, onSettings }: { state: AppS
   const [index, setIndex] = useState(0);
   const listId = useId();
   const list = useRef<HTMLDivElement>(null);
-  const models = filterModels(state.models, query);
+  const catalog = availableModels(state);
+  const models = filterModels(catalog, query);
   const activeIndex = Math.max(0, Math.min(index, models.length - 1));
-  const current = state.settings?.provider;
+  const current = selectionContext(state);
   const busy = state.selectingModel || state.providerBusy || state.closing;
   const blocked = busy || state.anyReplyPending;
   useEffect(() => { list.current?.querySelector('[data-active="true"]')?.scrollIntoView({ block: 'nearest' }); }, [activeIndex, query, state.models]);
@@ -50,9 +61,9 @@ export function ModelPicker({ state, store, onClose, onSettings }: { state: AppS
   };
   const refresh = () => { void store.refreshModels().catch(() => {}); };
   return <Modal title="Choose a model" onClose={onClose} className="model-modal" dismissible={!busy}>
-    <p className="field-note model-intro">Used for future replies in all workspaces.</p>
+    <p className="field-note model-intro">Used by Hermes for future runs in this workspace only. Your current model stays selected until a change is acknowledged.</p>
     {!store.bridge.native ? <p className="search-empty">Models are available in the desktop app. This preview keeps your drafts, without connecting to AI.</p>
-      : !current?.baseUrl ? <p className="search-empty">Set up your AI connection to see its available models.</p>
+      : !current?.available ? <p className="search-empty">Set up your AI connection to see its available models.</p>
         : <>
           <div className="command-search"><MagnifyingGlass size={19} /><input autoFocus value={query} placeholder="Search models…" aria-label="Search models"
             role="combobox" aria-autocomplete="list" aria-expanded="true" aria-controls={listId}
@@ -63,12 +74,12 @@ export function ModelPicker({ state, store, onClose, onSettings }: { state: AppS
               if (event.key === 'ArrowUp') { event.preventDefault(); setIndex(Math.max(0, activeIndex - 1)); }
               if (event.key === 'Enter') { event.preventDefault(); if (models[activeIndex]) void choose(models[activeIndex]); }
             }} /></div>
-          <div className="model-list-heading"><span role="status">{state.modelsStatus === 'loading' ? 'Refreshing models…' : `${state.models.length} available`}</span>
+          <div className="model-list-heading"><span role="status">{state.modelsStatus === 'loading' ? 'Refreshing models…' : `${catalog.length} available`}</span>
             <button type="button" className="text-button muted" disabled={busy || state.modelsStatus === 'loading'} onClick={refresh}>Refresh</button></div>
-          {state.modelsError && <InlineError>{state.modelsError} {state.models.length > 0 && 'Previously discovered models are still listed.'}</InlineError>}
+          {state.modelsError && <InlineError>{state.modelsError} {catalog.length > 0 && 'Previously discovered models are still listed.'}</InlineError>}
           {state.modelSelectionError && <InlineError>{state.modelSelectionError}</InlineError>}
           {state.anyReplyPending && <p className="field-note">Finish or stop active replies before changing models.</p>}
-          {current.model && state.modelsStatus === 'ready' && !state.models.includes(current.model) && <p className="field-note model-notice">Your saved model is unavailable. Choose another model to reconnect.</p>}
+          {current.model && state.modelsStatus === 'ready' && !catalog.includes(current.model) && <p className="field-note model-notice">Your saved model is unavailable. Choose another model to reconnect.</p>}
           <div className="model-results" id={listId} ref={list} role="listbox" aria-label="Available models" aria-busy={state.modelsStatus === 'loading'}>
             {models.map((id, position) => <button type="button" role="option" id={`${listId}-${position}`} key={id} tabIndex={-1}
               aria-selected={id === current.model} data-active={position === activeIndex} disabled={blocked}
@@ -77,8 +88,8 @@ export function ModelPicker({ state, store, onClose, onSettings }: { state: AppS
               {id === current.model && <span className="model-current">{current.verified ? <><Check size={14} />Current</> : 'Needs a check'}</span>}
             </button>)}
           </div>
-          {!models.length && state.modelsStatus !== 'loading' && <p className="search-empty">{state.models.length ? 'No matching models. Try a shorter search.' : state.modelsStatus === 'ready' ? 'No models returned. Refresh or check your connection settings.' : 'Refresh to discover models from your connection.'}</p>}
-          {state.selectingModel && <p className="field-note" role="status">Saving and checking your model…</p>}
+          {!models.length && state.modelsStatus !== 'loading' && <p className="search-empty">{catalog.length ? 'No matching models. Try a shorter search.' : state.modelsStatus === 'ready' ? 'No models returned. Refresh or check your connection settings.' : 'Refresh to discover models from your connection.'}</p>}
+          {state.selectingModel && <p className="field-note" role="status">Applying model; previous accepted selection retained until acknowledgement…</p>}
           <div className="palette-footer"><span><kbd>↑</kbd><kbd>↓</kbd> to move</span><span><kbd>↵</kbd> to choose</span><span><kbd>esc</kbd> to close</span></div>
         </>}
     <div className="model-settings"><button type="button" className="text-button muted" disabled={busy} onClick={onSettings}>Connection settings</button></div>

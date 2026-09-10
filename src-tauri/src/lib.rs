@@ -3,6 +3,7 @@ mod connectors;
 mod core;
 mod hermes;
 mod provider;
+mod runtime;
 mod store;
 mod types;
 mod validation;
@@ -70,7 +71,10 @@ async fn configure_provider(
     input: ProviderInput,
 ) -> AppResult<ProviderConfig> {
     first_party(&window)?;
-    state.lock()?.configure(input)
+    let _gate = state.runtime_gate.lock().await;
+    let provider = state.lock()?.configure(input)?;
+    runtime::managed::clear_model(&state).await?;
+    Ok(provider)
 }
 #[tauri::command]
 async fn check_provider(
@@ -133,7 +137,7 @@ async fn delete_workspace(
     workspace_id: String,
 ) -> AppResult<()> {
     first_party(&window)?;
-    state.lock()?.delete(&workspace_id)
+    runtime::runs::delete_workspace(window.app_handle(), &state, &workspace_id).await
 }
 #[tauri::command]
 async fn start_message(
@@ -144,6 +148,27 @@ async fn start_message(
     request_id: String,
 ) -> AppResult<ChatWorkspace> {
     first_party(&window)?;
+    validation::id(&workspace_id)?;
+    validation::id(&request_id)?;
+    validation::text(&content, 16_000, false)?;
+    state.lock()?.store.workspace(&workspace_id)?;
+    let cold_catalog = {
+        let core = state.lock()?;
+        let saved = core.store.runtime_config()?;
+        saved.approved_models.is_empty().then(|| {
+            (
+                core.store.provider().map(|p| p.generation),
+                core.store
+                    .runtime_workspace(&workspace_id)
+                    .map(|w| w.model_id),
+            )
+        })
+    };
+    if let Some((generation, model)) = cold_catalog {
+        core::check_selected_model(&state, &model?, generation?).await?;
+    } else {
+        runtime::managed::sync_model(&state, None).await?;
+    }
     state.lock()?.start(&workspace_id, &content, &request_id)
 }
 #[tauri::command]
@@ -154,7 +179,7 @@ async fn complete_message(
     request_id: String,
 ) -> AppResult<ChatWorkspace> {
     first_party(&window)?;
-    core::complete(&state, workspace_id, request_id).await
+    runtime::runs::complete(window.app_handle(), &state, workspace_id, request_id).await
 }
 #[tauri::command]
 async fn cancel_message(
@@ -164,7 +189,129 @@ async fn cancel_message(
     request_id: String,
 ) -> AppResult<ChatWorkspace> {
     first_party(&window)?;
-    state.lock()?.cancel(&workspace_id, &request_id)
+    if state
+        .runtime_stopping
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        state.runtime_process.shutdown().await;
+        let core = state.lock()?;
+        return runtime::runs::interrupt_for_quit(&core, &workspace_id, &request_id);
+    }
+    let hermes = state.lock()?.store.runtime_request(&request_id)?.is_some();
+    if hermes {
+        runtime::runs::cancel(window.app_handle(), &state, &workspace_id, &request_id).await
+    } else {
+        state.lock()?.cancel(&workspace_id, &request_id)
+    }
+}
+
+#[derive(Default)]
+struct Lifecycle {
+    quitting: std::sync::atomic::AtomicBool,
+    stopped: std::sync::atomic::AtomicBool,
+    tray_ready: std::sync::atomic::AtomicBool,
+}
+fn show_main(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+}
+fn stop_and_exit(app: &tauri::AppHandle) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        runtime::managed::shutdown(&app.state::<NativeState>()).await;
+        app.state::<browser::BrowserState>().shutdown();
+        app.state::<Lifecycle>()
+            .stopped
+            .store(true, std::sync::atomic::Ordering::Release);
+        app.exit(0);
+    });
+}
+fn request_quit(app: &tauri::AppHandle) {
+    // Stopping owned execution never waits on WebKit or a blocking Keychain prompt.
+    let native = app.state::<NativeState>();
+    native
+        .runtime_stopping
+        .store(true, std::sync::atomic::Ordering::Release);
+    native.runtime_process.request_stop();
+    app.state::<Lifecycle>()
+        .quitting
+        .store(true, std::sync::atomic::Ordering::Release);
+    match app.get_webview_window("main") {
+        Some(window) if window.is_visible().unwrap_or(true) => {
+            let _ = window.close();
+        }
+        _ => stop_and_exit(app),
+    }
+}
+fn install_lifecycle(app: &tauri::AppHandle) -> Result<(), Box<dyn std::error::Error>> {
+    use tauri::menu::{Menu, MenuItem};
+    let show = MenuItem::with_id(app, "forma-show", "Show Forma", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "forma-quit", "Quit Forma", true, None::<&str>)?;
+    // Preserve native Edit/Window menus and webview copy/paste shortcuts.
+    // The default Quit item reaches ExitRequested; tray Quit uses the same path.
+    app.set_menu(Menu::default(app)?)?;
+    app.on_menu_event(|app, event| match event.id().as_ref() {
+        "forma-show" => show_main(app),
+        "forma-quit" => request_quit(app),
+        _ => (),
+    });
+    let menu = Menu::with_items(app, &[&show, &quit])?;
+    let mut tray = tauri::tray::TrayIconBuilder::with_id("forma-runtime")
+        .menu(&menu)
+        .tooltip("Forma — Hermes runs only while this app and computer are awake")
+        .title("Forma");
+    if let Some(icon) = app.default_window_icon() {
+        tray = tray.icon(icon.clone());
+    }
+    if tray.build(app).is_ok() {
+        app.state::<Lifecycle>()
+            .tray_ready
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+    Ok(())
+}
+#[tauri::command]
+async fn finish_window_close(
+    window: WebviewWindow,
+    state: State<'_, NativeState>,
+) -> AppResult<String> {
+    first_party(&window)?;
+    let app = window.app_handle();
+    let quitting = app
+        .state::<Lifecycle>()
+        .quitting
+        .load(std::sync::atomic::Ordering::Acquire);
+    if !quitting {
+        let approved = state.lock()?.store.runtime_config()?.background_approved;
+        let enabled = match runtime::managed::has_enabled_schedules(&state).await {
+            Ok(enabled) => enabled,
+            Err(_) if !approved => false,
+            Err(_) => return Err(AppError::new("runtime_close", "Schedule state is unknown. Keep Forma open or explicitly Quit Forma to stop its processes.")),
+        };
+        if enabled {
+            if !app
+                .state::<Lifecycle>()
+                .tray_ready
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                return Err(AppError::new("runtime_close", "Forma could not show its background status. Keep this window open or explicitly Quit Forma."));
+            }
+            window
+                .hide()
+                .map_err(|_| AppError::new("runtime_close", "Forma could not hide its window."))?;
+            return Ok("hidden".into());
+        }
+    }
+    runtime::managed::shutdown(&state).await;
+    app.state::<Lifecycle>()
+        .stopped
+        .store(true, std::sync::atomic::Ordering::Release);
+    window.destroy().map_err(|_| AppError::storage())?;
+    app.exit(0);
+    Ok("closed".into())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -208,7 +355,13 @@ pub fn run() {
                 });
             // Keep the UI available to explain recoverable storage errors; never reset the DB.
             app.manage(NativeState::new(native));
-            app.set_menu(tauri::menu::Menu::default(app.handle())?)?;
+            app.manage(Lifecycle::default());
+            install_lifecycle(app.handle())?;
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let state = handle.state::<NativeState>();
+                let _ = runtime::managed::start(&handle, &state).await;
+            });
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -232,6 +385,7 @@ pub fn run() {
             browser::browser_back,
             browser::browser_forward,
             browser::browser_reload,
+            finish_window_close,
             app_bootstrap,
             save_settings,
             configure_provider,
@@ -251,19 +405,36 @@ pub fn run() {
             connectors::connectors_capabilities,
             connectors::connectors_start_google,
             connectors::connectors_refresh,
-            connectors::connectors_disconnect
+            connectors::connectors_disconnect,
+            connectors::connectors_grants_list,
+            connectors::connectors_grant_register,
+            connectors::connectors_grant_revoke,
+            connectors::connectors_run_cancel,
+            connectors::connectors_read_capabilities,
+            runtime::runtime_status,
+            runtime::runtime_retry,
+            runtime::runtime_check,
+            runtime::runtime_workspace,
+            runtime::runtime_select_model,
+            runtime::runtime_progress,
+            runtime::resources::runtime_resource
         ])
         .build(tauri::generate_context!())
         .expect("Unable to start Forma")
-        .run(|app, event| {
-            if let tauri::RunEvent::ExitRequested { api, .. } = event {
-                if let Some(window) = app.get_webview_window("main") {
-                    // Cmd-Q follows the same frontend draft-flush path as the close button.
-                    // Once the frontend destroys the last window, allow the subsequent exit.
+        .run(|app, event| match event {
+            tauri::RunEvent::ExitRequested { api, .. } => {
+                let lifecycle = app.state::<Lifecycle>();
+                if !lifecycle.stopped.load(std::sync::atomic::Ordering::Acquire) {
                     api.prevent_exit();
-                    let _ = window.close();
+                    request_quit(app);
                 }
             }
+            tauri::RunEvent::Exit => {
+                app.state::<browser::BrowserState>().shutdown();
+            }
+            #[cfg(target_os = "macos")]
+            tauri::RunEvent::Reopen { .. } => show_main(app),
+            _ => (),
         });
 }
 

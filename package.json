@@ -8,10 +8,14 @@
     "dev": "vite --host 127.0.0.1 --port 1420 --strictPort",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview --host 127.0.0.1 --port 1421 --strictPort",
+    "runtime:prepare": "node scripts/managed-hermes/prepare.mjs",
+    "runtime:verify": "node scripts/managed-hermes/prepare.mjs --verify",
+    "desktop:dev:prepare": "pnpm runtime:prepare && pnpm dev",
+    "desktop:build:prepare": "pnpm runtime:prepare && pnpm build",
     "desktop": "tauri dev",
     "desktop:build": "tauri build --debug --bundles app --no-sign",
     "typecheck": "tsc --noEmit",
-    "test": "node --experimental-transform-types --input-type=module -e \"for (const [file, run] of [['store', 'runStoreRegressionChecks'], ['browser', 'runBrowserRegressionChecks'], ['message', 'runMessageRegressionChecks']]) { const m = await import('./src/app/' + file + '.regression.ts'); console.log(file, await m[run]()); }\""
+    "test": "node --experimental-transform-types --input-type=module -e \"for (const [file, run] of [['store', 'runStoreRegressionChecks'], ['browser', 'runBrowserRegressionChecks'], ['message', 'runMessageRegressionChecks'], ['interface', 'runInterfaceRegressionChecks'], ['runtime', 'runRuntimeRegressionChecks']]) { const m = await import('./src/app/' + file + '.regression.ts'); console.log(file, await m[run]()); }\""
   },
   "dependencies": {
     "@phosphor-icons/react": "2.1.10",

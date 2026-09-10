@@ -9,6 +9,8 @@ node_modules/
 dist/
 src-tauri/target/
 src-tauri/gen/
+# Generated, checksummed managed Python / Hermes distribution (never profiles).
+src-tauri/resources/managed-hermes/
 .DS_Store
 *.local
 
