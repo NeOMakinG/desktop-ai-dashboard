@@ -22,11 +22,12 @@ export function BrowserConnections({ browser, openWithEngine }: {
   const open = (service: BrowserService, url?: string) => openWithEngine
     ? void openWithEngine(service, url)
     : void browser.open(service, url);
-  return <div className="browser-connections">
+  return <div className="browser-connections" role="group" aria-label="Website browsing">
+    <p className="field-note">Website browsing in Forma is separate from connecting Google. These websites do not give the agent Gmail or Calendar access.</p>
     {services.map(service => <div className="account-row" key={service.id}>
       <span className="account-icon"><service.icon size={20} /></span>
       <span>{service.name}<span className="row-detail">{service.detail}</span></span>
-      <button type="button" className="button secondary" disabled={!enabled} onClick={() => open(service.id)}>Sign in <ArrowSquareOut size={14} /></button>
+      <button type="button" className="button secondary" disabled={!enabled} onClick={() => open(service.id)}>Open website <ArrowSquareOut size={14} /></button>
     </div>)}
     <div className="account-row">
       <span className="account-icon"><Globe size={20} /></span>
@@ -37,7 +38,7 @@ export function BrowserConnections({ browser, openWithEngine }: {
       event.preventDefault();
       if (enabled && customUrl.trim()) open('custom', customUrl.trim());
     }}><label>Website address<input autoFocus type="url" required value={customUrl} maxLength={2048} placeholder="https://…" disabled={!enabled} onChange={event => setCustomUrl(event.target.value)} /></label><button type="submit" className="button secondary" disabled={!enabled || !customUrl.trim()}>Open website</button></form>}
-    {!browser.native && <p className="field-note">Sign in from the desktop app.</p>}
+    {!browser.native && <p className="field-note">Open websites from the desktop app.</p>}
     {browser.native && !browser.status.available && <p className="field-note">{browser.status.error || 'The owned browser is not available on this build.'}</p>}
     {browser.busy && <p className="field-note" role="status">Opening your browser…</p>}
     {browser.error && <InlineError>{browser.error}</InlineError>}
@@ -108,7 +109,7 @@ export function BrowserView({ browser }: { browser: OwnedBrowser }) {
         {(open || browser.status.phase === 'opening') && <button type="button" className="text-button muted" onClick={() => { void browser.close(); }} disabled={browser.actionPending}><X size={15} />{open ? 'Close window' : 'Cancel opening'}</button>}
       </div>
     </div>
-    <section className="browser-service-section" aria-labelledby="browser-services-title"><h2 id="browser-services-title">Add your services</h2><BrowserConnections browser={browser} openWithEngine={openWithEngine} /></section>
+    <section className="browser-service-section" aria-labelledby="browser-services-title"><h2 id="browser-services-title">Browse websites</h2><BrowserConnections browser={browser} openWithEngine={openWithEngine} /></section>
     {browser.status.chromiumUnavailableReason && <p className="field-note">{browser.status.chromiumUnavailableReason}</p>}
     <details className="browser-details"><summary><LockSimple size={16} />About this browser</summary><p>Closing the window keeps its site sessions on this device. API access requires each service’s supported authorization; signing in does not create API keys. Browser automation is not connected to the agent yet.</p><p>Some services require sign-in through a supported external browser. Forma will not bypass their login requirements.</p></details>
   </section>;

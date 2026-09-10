@@ -1,0 +1,180 @@
+{
+  "fixtureKind": "synthetic-native-projection-contract-no-Google-access",
+  "args": {"startAt": "2026-09-01T00:00:00Z", "endAt": "2026-09-08T00:00:00Z", "maxItems": 100},
+  "cases": [
+    {
+      "name": "all-day-exclusive-end",
+      "accepted": true,
+      "providerEvent": {"id": "day1", "summary": "Synthetic café day", "start": {"date": "2026-09-02"}, "end": {"date": "2026-09-03"}, "status": "confirmed", "description": "BODY_MUST_NOT_LEAVE", "attendees": [{"email": "SECRET_ATTACHMENT"}]},
+      "nativeItem": {"id": "day1", "title": "Synthetic café day", "startAt": "2026-09-02", "endAt": "2026-09-03", "allDay": true}
+    },
+    {
+      "name": "all-day-spanning-window",
+      "accepted": true,
+      "providerEvent": {"id": "day2", "summary": "Synthetic spanning day", "start": {"date": "2026-08-30"}, "end": {"date": "2026-09-10"}, "status": "confirmed"},
+      "nativeItem": {"id": "day2", "title": "Synthetic spanning day", "startAt": "2026-08-30", "endAt": "2026-09-10", "allDay": true}
+    },
+    {
+      "name": "all-day-calendar-timezone-edge-not-UTC-midnight",
+      "accepted": true,
+      "providerEvent": {"id": "day3", "summary": "Synthetic western timezone day", "start": {"date": "2026-08-31"}, "end": {"date": "2026-09-01"}, "status": "confirmed"},
+      "nativeItem": {"id": "day3", "title": "Synthetic western timezone day", "startAt": "2026-08-31", "endAt": "2026-09-01", "allDay": true}
+    },
+    {
+      "name": "timed-positive-offset",
+      "accepted": true,
+      "providerEvent": {"id": "time1", "summary": "Synthetic offset", "start": {"dateTime": "2026-09-02T09:00:00+05:30"}, "end": {"dateTime": "2026-09-02T10:00:00+05:30"}, "status": "confirmed"},
+      "nativeItem": {"id": "time1", "title": "Synthetic offset", "startAt": "2026-09-02T09:00:00+05:30", "endAt": "2026-09-02T10:00:00+05:30", "allDay": false}
+    },
+    {
+      "name": "timed-negative-offset-nanoseconds",
+      "accepted": true,
+      "providerEvent": {"id": "time2", "summary": "Synthetic precision", "start": {"dateTime": "2026-09-02T09:00:00.123456789-07:00"}, "end": {"dateTime": "2026-09-02T10:00:00.987654321-07:00"}, "status": "tentative"},
+      "nativeItem": {"id": "time2", "title": "Synthetic precision", "startAt": "2026-09-02T09:00:00.123456789-07:00", "endAt": "2026-09-02T10:00:00.987654321-07:00", "allDay": false}
+    },
+    {
+      "name": "timed-UTC",
+      "accepted": true,
+      "providerEvent": {"id": "time3", "summary": "Synthetic UTC", "start": {"dateTime": "2026-09-02T09:00:00Z"}, "end": {"dateTime": "2026-09-02T10:00:00Z"}, "status": "confirmed"},
+      "nativeItem": {"id": "time3", "title": "Synthetic UTC", "startAt": "2026-09-02T09:00:00Z", "endAt": "2026-09-02T10:00:00Z", "allDay": false}
+    },
+    {
+      "name": "timed-spanning-both-window-edges",
+      "accepted": true,
+      "providerEvent": {"id": "time4", "summary": "Synthetic spanning interval", "start": {"dateTime": "2026-08-30T09:00:00-07:00"}, "end": {"dateTime": "2026-09-10T10:00:00+05:30"}, "status": "confirmed"},
+      "nativeItem": {"id": "time4", "title": "Synthetic spanning interval", "startAt": "2026-08-30T09:00:00-07:00", "endAt": "2026-09-10T10:00:00+05:30", "allDay": false}
+    },
+    {
+      "name": "timed-local-clock-order-is-not-instant-order",
+      "accepted": true,
+      "providerEvent": {"id": "time5", "summary": "Synthetic clock shift", "start": {"dateTime": "2026-09-02T10:00:00+02:00"}, "end": {"dateTime": "2026-09-02T09:30:00+01:00"}, "status": "confirmed"},
+      "nativeItem": {"id": "time5", "title": "Synthetic clock shift", "startAt": "2026-09-02T10:00:00+02:00", "endAt": "2026-09-02T09:30:00+01:00", "allDay": false}
+    },
+    {
+      "name": "malformed-date",
+      "accepted": false,
+      "providerEvent": {"id": "bad1", "summary": "Synthetic invalid date", "start": {"date": "2026-02-30"}, "end": {"date": "2026-09-03"}, "status": "confirmed"},
+      "nativeItem": {"id": "bad1", "title": "Synthetic invalid date", "startAt": "2026-02-30", "endAt": "2026-09-03", "allDay": true}
+    },
+    {
+      "name": "malformed-timed-missing-offset",
+      "accepted": false,
+      "providerEvent": {"id": "bad2", "summary": "Synthetic missing offset", "start": {"dateTime": "2026-09-02T09:00:00"}, "end": {"dateTime": "2026-09-02T10:00:00Z"}, "status": "confirmed"},
+      "nativeItem": {"id": "bad2", "title": "Synthetic missing offset", "startAt": "2026-09-02T09:00:00", "endAt": "2026-09-02T10:00:00Z", "allDay": false}
+    },
+    {
+      "name": "malformed-offset-minute",
+      "accepted": false,
+      "providerEvent": {"id": "bad3", "summary": "Synthetic invalid offset", "start": {"dateTime": "2026-09-02T09:00:00+01:60"}, "end": {"dateTime": "2026-09-02T10:00:00Z"}, "status": "confirmed"},
+      "nativeItem": {"id": "bad3", "title": "Synthetic invalid offset", "startAt": "2026-09-02T09:00:00+01:60", "endAt": "2026-09-02T10:00:00Z", "allDay": false}
+    },
+    {
+      "name": "inverted-all-day",
+      "accepted": false,
+      "providerEvent": {"id": "bad4", "summary": "Synthetic inverted day", "start": {"date": "2026-09-03"}, "end": {"date": "2026-09-02"}, "status": "confirmed"},
+      "nativeItem": {"id": "bad4", "title": "Synthetic inverted day", "startAt": "2026-09-03", "endAt": "2026-09-02", "allDay": true}
+    },
+    {
+      "name": "empty-exclusive-all-day",
+      "accepted": false,
+      "providerEvent": {"id": "bad5", "summary": "Synthetic zero day", "start": {"date": "2026-09-02"}, "end": {"date": "2026-09-02"}, "status": "confirmed"},
+      "nativeItem": {"id": "bad5", "title": "Synthetic zero day", "startAt": "2026-09-02", "endAt": "2026-09-02", "allDay": true}
+    },
+    {
+      "name": "inverted-timed-instant-despite-clock-order",
+      "accepted": false,
+      "providerEvent": {"id": "bad6", "summary": "Synthetic inverted instant", "start": {"dateTime": "2026-09-02T09:00:00-07:00"}, "end": {"dateTime": "2026-09-02T10:00:00+05:30"}, "status": "confirmed"},
+      "nativeItem": {"id": "bad6", "title": "Synthetic inverted instant", "startAt": "2026-09-02T09:00:00-07:00", "endAt": "2026-09-02T10:00:00+05:30", "allDay": false}
+    },
+    {
+      "name": "empty-timed-equivalent-offsets",
+      "accepted": false,
+      "providerEvent": {"id": "bad7", "summary": "Synthetic equivalent instants", "start": {"dateTime": "2026-09-02T09:00:00+01:00"}, "end": {"dateTime": "2026-09-02T08:00:00Z"}, "status": "confirmed"},
+      "nativeItem": {"id": "bad7", "title": "Synthetic equivalent instants", "startAt": "2026-09-02T09:00:00+01:00", "endAt": "2026-09-02T08:00:00Z", "allDay": false}
+    },
+    {
+      "name": "timed-one-nanosecond-interval",
+      "accepted": true,
+      "providerEvent": {"id": "nano1", "summary": "Synthetic nanosecond", "start": {"dateTime": "2026-09-02T09:00:00.123456788Z"}, "end": {"dateTime": "2026-09-02T09:00:00.123456789Z"}, "status": "confirmed"},
+      "nativeItem": {"id": "nano1", "title": "Synthetic nanosecond", "startAt": "2026-09-02T09:00:00.123456788Z", "endAt": "2026-09-02T09:00:00.123456789Z", "allDay": false}
+    },
+    {
+      "name": "timed-inverted-nanoseconds",
+      "accepted": false,
+      "providerEvent": {"id": "nano2", "summary": "Synthetic inverted nanoseconds", "start": {"dateTime": "2026-09-02T09:00:00.123456789Z"}, "end": {"dateTime": "2026-09-02T09:00:00.123456788Z"}, "status": "confirmed"},
+      "nativeItem": {"id": "nano2", "title": "Synthetic inverted nanoseconds", "startAt": "2026-09-02T09:00:00.123456789Z", "endAt": "2026-09-02T09:00:00.123456788Z", "allDay": false}
+    },
+    {
+      "name": "timed-fractional-window-lower-overlap",
+      "accepted": true,
+      "args": {"startAt": "2026-09-01T00:00:00.123456Z", "endAt": "2026-09-02T00:00:00.123456Z", "maxItems": 100},
+      "providerEvent": {"id": "edge1", "summary": "Synthetic lower edge", "start": {"dateTime": "2026-08-31T23:59:59Z"}, "end": {"dateTime": "2026-09-01T00:00:00.123456001Z"}, "status": "confirmed"},
+      "nativeItem": {"id": "edge1", "title": "Synthetic lower edge", "startAt": "2026-08-31T23:59:59Z", "endAt": "2026-09-01T00:00:00.123456001Z", "allDay": false}
+    },
+    {
+      "name": "timed-fractional-window-upper-overlap",
+      "accepted": true,
+      "args": {"startAt": "2026-09-01T00:00:00.123456Z", "endAt": "2026-09-02T00:00:00.123456Z", "maxItems": 100},
+      "providerEvent": {"id": "edge2", "summary": "Synthetic upper edge", "start": {"dateTime": "2026-09-02T00:00:00.123455999Z"}, "end": {"dateTime": "2026-09-02T00:00:01Z"}, "status": "confirmed"},
+      "nativeItem": {"id": "edge2", "title": "Synthetic upper edge", "startAt": "2026-09-02T00:00:00.123455999Z", "endAt": "2026-09-02T00:00:01Z", "allDay": false}
+    },
+    {
+      "name": "timed-fractional-window-lower-exclusive",
+      "accepted": false,
+      "filtered": true,
+      "args": {"startAt": "2026-09-01T00:00:00.123456Z", "endAt": "2026-09-02T00:00:00.123456Z", "maxItems": 100},
+      "providerEvent": {"id": "edge3", "summary": "Synthetic lower exclusive", "start": {"dateTime": "2026-08-31T23:59:59Z"}, "end": {"dateTime": "2026-09-01T00:00:00.123456Z"}, "status": "confirmed"},
+      "nativeItem": {"id": "edge3", "title": "Synthetic lower exclusive", "startAt": "2026-08-31T23:59:59Z", "endAt": "2026-09-01T00:00:00.123456Z", "allDay": false}
+    },
+    {
+      "name": "timed-fractional-window-upper-exclusive",
+      "accepted": false,
+      "filtered": true,
+      "args": {"startAt": "2026-09-01T00:00:00.123456Z", "endAt": "2026-09-02T00:00:00.123456Z", "maxItems": 100},
+      "providerEvent": {"id": "edge4", "summary": "Synthetic upper exclusive", "start": {"dateTime": "2026-09-02T00:00:00.123456Z"}, "end": {"dateTime": "2026-09-02T00:00:01Z"}, "status": "confirmed"},
+      "nativeItem": {"id": "edge4", "title": "Synthetic upper exclusive", "startAt": "2026-09-02T00:00:00.123456Z", "endAt": "2026-09-02T00:00:01Z", "allDay": false}
+    },
+    {
+      "name": "timed-far-year-nanoseconds-without-i64-overflow",
+      "accepted": true,
+      "args": {"startAt": "2500-09-01T00:00:00Z", "endAt": "2500-09-08T00:00:00Z", "maxItems": 100},
+      "providerEvent": {"id": "far1", "summary": "Synthetic far year", "start": {"dateTime": "2500-09-02T09:00:00.123456788+05:30"}, "end": {"dateTime": "2500-09-02T09:00:00.123456789+05:30"}, "status": "confirmed"},
+      "nativeItem": {"id": "far1", "title": "Synthetic far year", "startAt": "2500-09-02T09:00:00.123456788+05:30", "endAt": "2500-09-02T09:00:00.123456789+05:30", "allDay": false}
+    }
+  ],
+  "requestCases": [
+    {"name": "exact-seven-days-seconds", "accepted": true, "args": {"startAt": "2026-09-01T00:00:00Z", "endAt": "2026-09-08T00:00:00Z", "maxItems": 100}},
+    {"name": "exact-seven-days-six-fractions", "accepted": true, "args": {"startAt": "2026-09-01T00:00:00.000999Z", "endAt": "2026-09-08T00:00:00.000999Z", "maxItems": 100}},
+    {"name": "over-seven-days-by-999-microseconds", "accepted": false, "args": {"startAt": "2026-09-01T00:00:00.000Z", "endAt": "2026-09-08T00:00:00.000999Z", "maxItems": 100}},
+    {"name": "positive-one-microsecond-window", "accepted": true, "args": {"startAt": "2026-09-01T00:00:00.000000Z", "endAt": "2026-09-01T00:00:00.000001Z", "maxItems": 100}},
+    {"name": "zero-exact-window", "accepted": false, "args": {"startAt": "2026-09-01T00:00:00.000001Z", "endAt": "2026-09-01T00:00:00.000001Z", "maxItems": 100}},
+    {"name": "inverted-microsecond-window", "accepted": false, "args": {"startAt": "2026-09-01T00:00:00.000002Z", "endAt": "2026-09-01T00:00:00.000001Z", "maxItems": 100}},
+    {"name": "seven-fraction-digits-denied", "accepted": false, "args": {"startAt": "2026-09-01T00:00:00.1234567Z", "endAt": "2026-09-02T00:00:00Z", "maxItems": 100}},
+    {"name": "eight-fraction-digits-denied", "accepted": false, "args": {"startAt": "2026-09-01T00:00:00.12345678Z", "endAt": "2026-09-02T00:00:00Z", "maxItems": 100}},
+    {"name": "nine-fraction-end-digits-denied", "accepted": false, "args": {"startAt": "2026-09-01T00:00:00Z", "endAt": "2026-09-02T00:00:00.123456789Z", "maxItems": 100}},
+    {"name": "request-offset-form-denied", "accepted": false, "args": {"startAt": "2026-09-01T00:00:00+00:00", "endAt": "2026-09-02T00:00:00Z", "maxItems": 100}},
+    {"name": "lowercase-t-denied", "accepted": false, "args": {"startAt": "2026-09-01t00:00:00Z", "endAt": "2026-09-02T00:00:00Z", "maxItems": 100}},
+    {"name": "lowercase-z-denied", "accepted": false, "args": {"startAt": "2026-09-01T00:00:00z", "endAt": "2026-09-02T00:00:00Z", "maxItems": 100}},
+    {"name": "year-zero-denied", "accepted": false, "args": {"startAt": "0000-09-01T00:00:00Z", "endAt": "0000-09-02T00:00:00Z", "maxItems": 100}},
+    {"name": "leap-second-request-denied", "accepted": false, "args": {"startAt": "2026-09-01T00:00:60Z", "endAt": "2026-09-02T00:00:00Z", "maxItems": 100}},
+    {"name": "empty-request-timestamp-denied", "accepted": false, "args": {"startAt": "", "endAt": "2026-09-02T00:00:00Z", "maxItems": 100}},
+    {"name": "empty-request-fraction-denied", "accepted": false, "args": {"startAt": "2026-09-01T00:00:00.Z", "endAt": "2026-09-02T00:00:00Z", "maxItems": 100}}
+  ],
+  "gmailMicrosecondCases": [
+    {"name": "microsecond-edges-use-ceil-not-floor", "startOffsetMicros": 1, "endOffsetMicros": 2001, "records": [
+      {"id": "abc0", "offsetMillis": 0, "included": false}, {"id": "abc1", "offsetMillis": 1, "included": true},
+      {"id": "abc2", "offsetMillis": 2, "included": true}, {"id": "abc3", "offsetMillis": 3, "included": false}]},
+    {"name": "exact-millisecond-inclusive-start-exclusive-end", "startOffsetMicros": 1000, "endOffsetMicros": 2000, "records": [
+      {"id": "abc0", "offsetMillis": 0, "included": false}, {"id": "abc1", "offsetMillis": 1, "included": true},
+      {"id": "abc2", "offsetMillis": 2, "included": false}, {"id": "abc3", "offsetMillis": 3, "included": false}]}
+  ],
+  "sizeCases": [
+    {"name": "id-256", "count": 1, "idLength": 256, "accepted": true},
+    {"name": "id-257", "count": 1, "idLength": 257, "accepted": true},
+    {"name": "id-1024", "count": 1, "idLength": 1024, "accepted": true},
+    {"name": "id-1025", "count": 1, "idLength": 1025, "accepted": false},
+    {"name": "100-items-at-cap", "count": 100, "accepted": true},
+    {"name": "101-items-oversized", "count": 101, "accepted": false},
+    {"name": "UTF8-result-byte-budget", "count": 100, "titleRepeat": 900, "titleCharacter": "界", "accepted": false}
+  ]
+}

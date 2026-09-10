@@ -22,7 +22,7 @@ type Attempt = {
   error: { code: string; message: string } | null;
 };
 type Snapshot = { revision: number; attempt: Attempt | null; items: ConnectorStatus[]; cleanupIds: string[] };
-type StartResponse = { authorizeUrl: string; attemptId: string };
+type StartResponse = { attemptId: string };
 
 function message(error: unknown): string {
   if (typeof error === 'object' && error && 'message' in error && typeof error.message === 'string') return error.message;
@@ -101,8 +101,7 @@ export function useConnectors(native: boolean) {
       const response = await invoke<StartResponse>('connectors_start_google', { scopes: [...scopes] });
       await refresh();
       if (!alive.current || epoch !== session.current) return null;
-      // A terminal result can race the start response. Never reopen an obsolete URL.
-      if (current.current?.attempt?.id !== response.attemptId || current.current.attempt.phase !== 'pending') return null;
+      // Native opens the system browser; the renderer receives only attempt identity.
       return response;
     } catch (failure) {
       if (alive.current && epoch === session.current) setError(message(failure));

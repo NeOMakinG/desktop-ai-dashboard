@@ -8,6 +8,7 @@ pub use grants::{ConnectorGrant, EgressConsent, GrantRequest, ReadOperation, Run
 pub use reads::{dispatch_runtime_read, validate_runtime_delivery, ConnectorReadResult};
 mod loopback;
 mod oauth;
+mod opener;
 mod store;
 
 use crate::types::{AppError, AppResult};
@@ -54,7 +55,6 @@ pub struct ConnectorStatus {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StartResponse {
-    pub authorize_url: String,
     pub attempt_id: String,
 }
 
@@ -390,6 +390,49 @@ fn finish_attempt(core: &ConnectorsCore, id: &str, result: AppResult<()>) {
     }
 }
 
+// Until launch succeeds, even a dropped IPC future must retire its own attempt
+// and close its bound socket. Stale cleanup cannot cancel a replacement attempt.
+struct BrowserLaunchLease<'a> {
+    core: &'a ConnectorsCore,
+    id: &'a str,
+    loopback: Option<Loopback>,
+    admitted: bool,
+}
+impl Drop for BrowserLaunchLease<'_> {
+    fn drop(&mut self) {
+        if self.admitted && self.loopback.is_some() {
+            finish_attempt(self.core, self.id, Err(opener::open_error()));
+        }
+    }
+}
+async fn launch_google_browser<F: std::future::Future<Output = AppResult<()>>>(
+    core: &ConnectorsCore,
+    id: &str,
+    loopback: Loopback,
+    authorize_url: &str,
+    cancel: &tokio_util::sync::CancellationToken,
+    open: impl FnOnce(&str) -> AppResult<F>,
+) -> AppResult<Loopback> {
+    let mut lease = BrowserLaunchLease { core, id, loopback: Some(loopback), admitted: false };
+    let launch = {
+        let mut life = lifecycle_guard(core)?;
+        life.check(id)?;
+        if life.attempt.as_ref().map(|attempt| &attempt.phase) != Some(&lifecycle::AttemptPhase::Pending) {
+            return Err(lifecycle::stale_error());
+        }
+        lease.admitted = true;
+        open(authorize_url)?
+    };
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => return Err(lifecycle::stale_error()),
+        _ = tokio::time::sleep(Duration::from_secs(10)) => return Err(opener::open_error()),
+        result = launch => result?,
+    }
+    lifecycle_guard(core)?.check(id)?;
+    Ok(lease.loopback.take().unwrap())
+}
+
 // A dropped/cancelled command future also releases refresh ownership.
 struct RefreshLease {
     core: Arc<ConnectorsCore>,
@@ -561,13 +604,15 @@ pub async fn connectors_capabilities(
     _app: AppHandle,
 ) -> AppResult<Capabilities> {
     crate::first_party(&window)?;
-    let available = client_id().is_ok();
+    let configured = client_id().is_ok();
     Ok(Capabilities {
-        google_available: available,
-        disabled_reason: if available {
-            None
-        } else {
+        google_available: configured && opener::supported(),
+        disabled_reason: if !configured {
             Some("Google OAuth client not configured. A supported desktop client and consent setup are required.")
+        } else if !opener::supported() {
+            Some("Google system-browser sign-in is not supported on this platform yet.")
+        } else {
+            None
         },
         default_scopes: DEFAULT_SCOPES.to_vec(),
     })
@@ -601,8 +646,14 @@ pub async fn connectors_start_google(
     let state = Zeroizing::new(oauth::generate_state());
     let (id, cancel, deadline) =
         lifecycle_guard(&core)?.begin(loopback.port(), (*state).clone(), CALLBACK_TIMEOUT)?;
-    let authorize_url =
-        oauth::authorize_url(client_id, &redirect, &scopes, &state, &pkce.challenge);
+    let authorize_url = Zeroizing::new(
+        oauth::authorize_url(client_id, &redirect, &scopes, &state, &pkce.challenge),
+    );
+    // The URL stays native-owned. Google OAuth never uses the embedded browser.
+    let loopback = match launch_google_browser(&core, &id, loopback, &authorize_url, &cancel, opener::spawn).await {
+        Ok(loopback) => loopback,
+        Err(error) => { emit_change(&app); return Err(error); }
+    };
     let attempt_id = id.clone();
     let app_handle = app.clone();
     let thread_core = Arc::clone(&core);
@@ -639,10 +690,7 @@ pub async fn connectors_start_google(
         return Err(error);
     }
     emit_change(&app);
-    Ok(StartResponse {
-        authorize_url,
-        attempt_id,
-    })
+    Ok(StartResponse { attempt_id })
 }
 #[tauri::command]
 pub async fn connectors_refresh(
@@ -809,6 +857,108 @@ mod tests {
             .begin(12345, "synthetic-state".into(), CALLBACK_TIMEOUT)
             .unwrap();
         commit_new(core, &id, &scopes(), tokens(Some(&scopes().join(" ")))).unwrap()
+    }
+    fn launch_fixture(core: &ConnectorsCore) -> (String, Loopback, String, tokio_util::sync::CancellationToken) {
+        let loopback = Loopback::bind().unwrap();
+        let (id, cancel, _) = lifecycle_guard(core).unwrap()
+            .begin(loopback.port(), "synthetic-state".into(), CALLBACK_TIMEOUT).unwrap();
+        let url = oauth::authorize_url("synthetic-client", &loopback.redirect_uri(CALLBACK_PATH), &scopes(), "synthetic-state", "synthetic-challenge");
+        (id, loopback, url, cancel)
+    }
+    fn assert_listener_closed(port: u16) {
+        // Rebinding proves the listener was dropped, without making an HTTP request.
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).unwrap();
+        drop(listener);
+    }
+    #[tokio::test]
+    async fn system_browser_launch_keeps_native_identity_and_returns_no_url() {
+        let core = core_with(Arc::new(MemorySecrets::default()));
+        let (id, loopback, url, cancel) = launch_fixture(&core);
+        let port = loopback.port();
+        let listener = launch_google_browser(&core, &id, loopback, &url, &cancel, |target| {
+            let parsed = reqwest::Url::parse(target).unwrap();
+            assert_eq!(parsed.origin().ascii_serialization(), "https://accounts.google.com");
+            assert_eq!(parsed.path(), "/o/oauth2/v2/auth");
+            let query: std::collections::HashMap<_, _> = parsed.query_pairs().into_owned().collect();
+            assert_eq!(query["redirect_uri"], format!("http://127.0.0.1:{port}{CALLBACK_PATH}"));
+            assert_eq!(query["state"], "synthetic-state");
+            assert_eq!(query["code_challenge_method"], "S256");
+            assert_eq!(query["scope"], scopes().join(" "));
+            Ok(std::future::ready(Ok(())))
+        }).await.unwrap();
+        assert_eq!(snapshot(&core).unwrap().attempt.unwrap().phase, lifecycle::AttemptPhase::Pending);
+        assert_eq!(serde_json::to_value(StartResponse { attempt_id: id.clone() }).unwrap(), serde_json::json!({"attemptId": id}));
+        lifecycle_guard(&core).unwrap().cancel(&id).unwrap();
+        assert!(cancel.is_cancelled());
+        drop(listener);
+        assert_listener_closed(port);
+    }
+    #[tokio::test]
+    async fn browser_spawn_and_wait_failure_retire_attempt_and_drop_listener() {
+        let core = core_with(Arc::new(MemorySecrets::default()));
+        for spawn_failure in [true, false] {
+            let (id, loopback, url, cancel) = launch_fixture(&core);
+            let port = loopback.port();
+            let result = launch_google_browser(&core, &id, loopback, &url, &cancel, |_| {
+                if spawn_failure { Err(opener::open_error()) }
+                else { Ok(std::future::ready(Err(opener::open_error()))) }
+            }).await;
+            assert_eq!(result.err().unwrap().code, "connector_browser");
+            assert!(cancel.is_cancelled());
+            let status = snapshot(&core).unwrap().attempt.unwrap();
+            assert_eq!(status.phase, lifecycle::AttemptPhase::Failed);
+            assert_eq!(status.error.unwrap().code, "connector_browser");
+            assert_listener_closed(port);
+        }
+    }
+    #[tokio::test]
+    async fn stale_browser_launch_cannot_open_or_cancel_a_replacement() {
+        let core = core_with(Arc::new(MemorySecrets::default()));
+        let (old, loopback, url, cancel) = launch_fixture(&core);
+        let port = loopback.port();
+        lifecycle_guard(&core).unwrap().cancel(&old).unwrap();
+        let (current, current_listener, _, _) = launch_fixture(&core);
+        let result = launch_google_browser(&core, &old, loopback, &url, &cancel, |_| {
+            panic!("A stale attempt must not invoke the opener");
+            #[allow(unreachable_code)]
+            Ok(std::future::ready(Ok(())))
+        }).await;
+        assert_eq!(result.err().unwrap().code, "connector_stale");
+        let status = snapshot(&core).unwrap().attempt.unwrap();
+        assert_eq!(status.id, current);
+        assert_eq!(status.phase, lifecycle::AttemptPhase::Pending);
+        assert_listener_closed(port);
+        lifecycle_guard(&core).unwrap().cancel(&current).unwrap();
+        drop(current_listener);
+    }
+    #[tokio::test]
+    async fn cancellation_during_browser_launch_and_dropped_future_release_listener() {
+        let core = core_with(Arc::new(MemorySecrets::default()));
+        let (id, loopback, url, cancel) = launch_fixture(&core);
+        let port = loopback.port();
+        let result = launch_google_browser(&core, &id, loopback, &url, &cancel, |_| {
+            Ok(async {
+                lifecycle_guard(&core).unwrap().cancel(&id).unwrap();
+                std::future::pending::<AppResult<()>>().await
+            })
+        }).await;
+        assert_eq!(result.err().unwrap().code, "connector_stale");
+        assert_eq!(snapshot(&core).unwrap().attempt.unwrap().phase, lifecycle::AttemptPhase::Cancelled);
+        assert_listener_closed(port);
+        let (id, loopback, url, cancel) = launch_fixture(&core);
+        let port = loopback.port();
+        {
+            let launch = launch_google_browser(&core, &id, loopback, &url, &cancel, |_| Ok(std::future::pending::<AppResult<()>>()));
+            tokio::pin!(launch);
+            tokio::select! {
+                biased;
+                _ = &mut launch => panic!("Fixture opener must remain pending"),
+                _ = std::future::ready(()) => {}
+            }
+        }
+        assert!(cancel.is_cancelled());
+        assert_eq!(snapshot(&core).unwrap().attempt.unwrap().phase, lifecycle::AttemptPhase::Failed);
+        assert_listener_closed(port);
     }
     #[test]
     fn scope_validation_rejects_missing_wide_and_duplicate_grants() {

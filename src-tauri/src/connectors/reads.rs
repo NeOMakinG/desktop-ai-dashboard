@@ -22,16 +22,41 @@ struct ReadArgs {
     end_at: String,
     max_items: usize,
 }
+fn read_instant(value: &str) -> AppResult<chrono::DateTime<chrono::Utc>> {
+    let bytes = value.as_bytes();
+    let valid_shape = (bytes.len() == 20
+        || ((22..=27).contains(&bytes.len())
+            && bytes[19] == b'.'
+            && bytes[20..bytes.len() - 1].iter().all(u8::is_ascii_digit)))
+        && bytes.last() == Some(&b'Z')
+        && bytes[..19]
+            .iter()
+            .zip(b"0000-00-00T00:00:00")
+            .all(|(actual, expected)| {
+                if *expected == b'0' {
+                    actual.is_ascii_digit()
+                } else {
+                    actual == expected
+                }
+            });
+    if !valid_shape || value.starts_with("0000-") {
+        return Err(AppError::invalid());
+    }
+    let instant = chrono::DateTime::parse_from_rfc3339(value).map_err(|_| AppError::invalid())?;
+    // Python datetime rejects leap seconds; requests share its UTC/microsecond contract.
+    if instant.timestamp_subsec_nanos() >= 1_000_000_000 {
+        return Err(AppError::invalid());
+    }
+    Ok(instant.with_timezone(&chrono::Utc))
+}
 impl ReadArgs {
     fn parse(context: &RuntimeReadContext) -> AppResult<Self> {
         let args: Self =
             serde_json::from_value(context.args.clone()).map_err(|_| AppError::invalid())?;
-        let start = timestamp(&args.start_at)?;
-        let end = timestamp(&args.end_at)?;
-        if !args.start_at.ends_with('Z')
-            || !args.end_at.ends_with('Z')
-            || end <= start
-            || end - start > WINDOW_MS
+        let start = read_instant(&args.start_at)?;
+        let end = read_instant(&args.end_at)?;
+        if end <= start
+            || end - start > chrono::Duration::milliseconds(WINDOW_MS)
             || args.max_items == 0
             || args.max_items > MAX_ITEMS
         {
@@ -40,8 +65,10 @@ impl ReadArgs {
         // Metadata scope has no q/date search. Only scan a rolling recent inbox,
         // never widen into older mail or pretend a bounded scan is a full count.
         if context.operation == ReadOperation::GmailListMetadata {
-            let now = chrono::Utc::now().timestamp_millis();
-            if start < now - WINDOW_MS || end > now + 60_000 {
+            let now = chrono::Utc::now();
+            if start < now - chrono::Duration::milliseconds(WINDOW_MS)
+                || end > now + chrono::Duration::seconds(60)
+            {
                 return Err(AppError::invalid());
             }
         }
@@ -416,8 +443,8 @@ async fn gmail(
     let mut pages = HashSet::new();
     let mut next: Option<String> = None;
     let mut truncated = false;
-    let start = timestamp(&args.start_at)?;
-    let end = timestamp(&args.end_at)?;
+    let start = read_instant(&args.start_at)?;
+    let end = read_instant(&args.end_at)?;
     for page in 0..MAX_PAGES {
         let remaining = MAX_ITEMS - scan_count;
         let mut url = reqwest::Url::parse(GMAIL_LIST).map_err(|_| AppError::invalid())?;
@@ -455,6 +482,7 @@ async fn gmail(
                 return Err(data_error());
             }
             let received: i64 = metadata.internal_date.parse().map_err(|_| data_error())?;
+            let received = chrono::DateTime::from_timestamp_millis(received).ok_or_else(data_error)?;
             if received < start
                 || received >= end
                 || !metadata.label_ids.iter().any(|l| l == "INBOX")
@@ -465,9 +493,7 @@ async fn gmail(
             {
                 continue;
             }
-            let received_at = chrono::DateTime::from_timestamp_millis(received)
-                .ok_or_else(data_error)?
-                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+            let received_at = received.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
             let mut sender = None;
             let mut subject = None;
             for header in metadata.payload.headers {
@@ -542,12 +568,19 @@ impl EventTime {
                 Ok((date, true))
             }
             (None, Some(time)) => {
-                timestamp(&time).map_err(|_| data_error())?;
+                calendar_instant(&time)?;
                 Ok((time, false))
             }
             _ => Err(data_error()),
         }
     }
+}
+fn calendar_instant(value: &str) -> AppResult<chrono::DateTime<chrono::FixedOffset>> {
+    if value.len() > 40 {
+        return Err(data_error());
+    }
+    // Compare nanoseconds without narrowing RFC3339's year range to i64 nanos.
+    chrono::DateTime::parse_from_rfc3339(value).map_err(|_| data_error())
 }
 async fn calendar(
     lease: &ReadLease,
@@ -561,6 +594,8 @@ async fn calendar(
     let mut next: Option<String> = None;
     let mut scanned = 0;
     let mut truncated = false;
+    let window_start = calendar_instant(&args.start_at)?;
+    let window_end = calendar_instant(&args.end_at)?;
     for page in 0..MAX_PAGES {
         let remaining = args.max_items - scanned;
         let mut url = reqwest::Url::parse(CALENDAR_LIST).map_err(|_| AppError::invalid())?;
@@ -597,12 +632,12 @@ async fn calendar(
                 return Err(data_error());
             }
             if !all_day {
-                let start = timestamp(&start_at)?;
-                let end = timestamp(&end_at)?;
+                let start = calendar_instant(&start_at)?;
+                let end = calendar_instant(&end_at)?;
                 if end <= start {
                     return Err(data_error());
                 }
-                if end <= timestamp(&args.start_at)? || start >= timestamp(&args.end_at)? {
+                if end <= window_start || start >= window_end {
                     continue;
                 }
             }

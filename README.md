@@ -58,7 +58,11 @@ Hermes runs under the app's ownership. Sending a message transmits that workspac
 
 The owned browser currently uses WebKit. Managed system Chromium is intentionally unavailable until network blocking can be enforced before startup traffic; Chromium navigation and Google-login compatibility are not verified.
 
-Google OAuth plumbing requires a build-time `FORMA_GOOGLE_CLIENT_ID`. Without a registered client, sign-in is visibly disabled. Real sign-in, the applicable Google policy/compliance gates, and connected-account runtime QA remain unverified. Local disconnection does not revoke access at Google. Neither browser sign-in nor OAuth plumbing gives the model Gmail, Calendar, or browser tools.
+Google authorization uses the external system browser, never Forma's embedded website window. Forma does not read or copy that browser's cookies or profiles. The native host owns the S256 PKCE/state flow and temporary loopback callback; the renderer receives only an attempt ID.
+
+Application maintainers must register a **Desktop app** OAuth client in Google Cloud, enable the Gmail and Calendar APIs, and configure the appropriate consent audience/test users. Supply its public client ID as build-time `FORMA_GOOGLE_CLIENT_ID`. Without that registration, sign-in is visibly disabled. See [Google's installed-app flow](https://developers.google.com/identity/protocols/oauth2/native-app). This is Google application registration, not a Hermes runtime setting.
+
+Real Google sign-in, applicable policy/compliance requirements, workspace grants, model-data egress, and end-to-end retention still require verification before live Gmail/Calendar tools are enabled. Calendar contract tests cover all-day dates and offset timestamps but do not prove real-account access. Local disconnection does not revoke access at Google. Website browsing and Google API authorization remain separate capabilities.
 
 Apple account access, explicitly attached browsers, additional Hermes toolsets, genuinely authored custom-code interfaces, MCP, paired desktop hosts, and mobile clients remain in the [product vision](docs/product/vision.md). They must not be inferred from the bounded Forma toolset or trusted component rendering. See the [domain glossary](CONTEXT.md) for the current meaning of workspace, connection, and device.
 

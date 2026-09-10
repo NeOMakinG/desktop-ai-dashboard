@@ -5,7 +5,7 @@ import json
 import math
 import re
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from urllib.parse import urlsplit
 
 REVISION = "349e6611a1c5d846a865368dd6c386b78edd1a54"
@@ -422,6 +422,33 @@ def google_args(value):
     return value
 
 
+def calendar_date(value):
+    require(isinstance(value, str) and re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", value),
+            "Expected all-day calendar date")
+    try:
+        return date.fromisoformat(value)
+    except ValueError as exc:
+        raise Fault("invalid_request", "Invalid all-day calendar date") from exc
+
+
+def calendar_instant(value):
+    # Keep native RFC3339 offsets and nanoseconds intact on the wire. Compare
+    # whole seconds plus fractional digits, without datetime's microsecond loss.
+    require(isinstance(value, str), "Expected RFC3339 calendar timestamp")
+    match = re.fullmatch(r"([0-9]{4}-[0-9]{2}-[0-9]{2}[Tt][0-9]{2}:[0-9]{2}:[0-9]{2})"
+                         r"(?:\.([0-9]{1,9}))?([Zz]|[+-][0-9]{2}:[0-9]{2})", value)
+    require(match is not None, "Expected RFC3339 calendar timestamp")
+    base, fraction, offset = match.groups()
+    if offset in ("Z", "z"):
+        offset = "+00:00"
+    else:
+        require(int(offset[1:3]) <= 23 and int(offset[4:6]) <= 59, "Invalid calendar offset")
+    try:
+        return datetime.fromisoformat(base + offset), (fraction or "").ljust(9, "0")
+    except ValueError as exc:
+        raise Fault("invalid_request", "Invalid calendar timestamp") from exc
+
+
 def google_result(data, request):
     obj(data, ("kind", "retrievedAt", "expiresAt", "startAt", "endAt", "truncated", "partial", "items"))
     gmail = request["toolName"] == GOOGLE_TOOLS[0]
@@ -442,10 +469,18 @@ def google_result(data, request):
         else:
             obj(item, ("id", "title", "startAt", "endAt", "allDay"), ("sourceUrl",))
             text(item["title"]); require(type(item["allDay"]) is bool, "Invalid allDay flag")
-            require(instant(item["startAt"]) < instant(item["endAt"]), "Invalid event interval")
-            require(instant(item["startAt"]) < instant(args["endAt"]) and instant(item["endAt"]) > instant(args["startAt"]),
-                    "Event outside window")
-        text(item["id"], 256, 1)
+            if item["allDay"]:
+                start, end = calendar_date(item["startAt"]), calendar_date(item["endAt"])
+                require(start < end, "Invalid exclusive all-day interval")
+                # The minimal native DTO has no calendar timezone. Google's
+                # timeMin/timeMax filter owns all-day overlap; UTC midnight
+                # conversion would invent instants and reject valid edge days.
+            else:
+                start, end = calendar_instant(item["startAt"]), calendar_instant(item["endAt"])
+                require(start < end, "Invalid event interval")
+                require(start < calendar_instant(args["endAt"]) and end > calendar_instant(args["startAt"]),
+                        "Event outside window")
+        text(item["id"], 256 if gmail else 1024, 1)
         if "sourceUrl" in item:
             text(item["sourceUrl"], 2000, 1); url = urlsplit(item["sourceUrl"])
             require(url.scheme == "https" and url.hostname == ("mail.google.com" if gmail else "calendar.google.com")

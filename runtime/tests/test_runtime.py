@@ -41,6 +41,148 @@ def proposal(wid=WORKSPACE):
     return {"workspaceId": wid, "expectedRevision": 0, "title": "Synthetic overview", "spec": spec()}
 
 
+def calendar_fixture():
+    return json.loads((Path(__file__).parent / "fixtures" / "calendar-native-results.json").read_text())
+
+
+def calendar_result(fixture, items):
+    now = datetime.now(UTC)
+    return {"kind": "calendarEvents", "retrievedAt": stamp(now),
+            "expiresAt": stamp(now + timedelta(seconds=90)),
+            "startAt": fixture["args"]["startAt"], "endAt": fixture["args"]["endAt"],
+            "truncated": False, "partial": False, "items": copy.deepcopy(items)}
+
+
+class CalendarContractCase(unittest.TestCase):
+    def setUp(self):
+        self.fixture = calendar_fixture()
+        self.request = {"toolName": GOOGLE_TOOLS[1], "args": self.fixture["args"]}
+
+    def test_shared_native_output_fixtures_preserve_dates_offsets_and_minimal_fields(self):
+        # Rust dispatch tests assert these exact items from synthetic provider
+        # responses. Dynamic freshness is the only time-dependent envelope data.
+        for case in self.fixture["cases"]:
+            with self.subTest(case=case["name"]):
+                fixture = dict(self.fixture, args=case.get("args", self.fixture["args"]))
+                request = dict(self.request, args=fixture["args"])
+                google_args(request["args"])
+                data = calendar_result(fixture, [case["nativeItem"]])
+                before = copy.deepcopy(data)
+                if case["accepted"]:
+                    self.assertIs(google_result(data, request), data)
+                    self.assertEqual(data, before)
+                else:
+                    with self.assertRaises(Fault): google_result(data, request)
+
+    def test_shared_native_output_count_and_UTF8_byte_limits(self):
+        for case in self.fixture["sizeCases"]:
+            with self.subTest(case=case["name"]):
+                items = []
+                for index in range(case["count"]):
+                    item = dict(self.fixture["cases"][0]["nativeItem"],
+                                id="a" * case["idLength"] if "idLength" in case else f"size_{index}")
+                    if "titleRepeat" in case:
+                        item["title"] = case["titleCharacter"] * case["titleRepeat"]
+                    items.append(item)
+                data = calendar_result(self.fixture, items)
+                if case["accepted"]:
+                    self.assertEqual(len(google_result(data, self.request)["items"]), case["count"])
+                else:
+                    with self.assertRaises(Fault): google_result(data, self.request)
+
+    def test_shared_request_precision_and_exact_seven_day_bounds(self):
+        for case in self.fixture["requestCases"]:
+            with self.subTest(case=case["name"]):
+                if case["accepted"]:
+                    self.assertEqual(google_args(case["args"]), case["args"])
+                else:
+                    with self.assertRaises(Fault): google_args(case["args"])
+
+    def test_shared_gmail_microsecond_edges_match_native_millisecond_records(self):
+        base = datetime.now(UTC).replace(microsecond=0) - timedelta(seconds=60)
+        for case in self.fixture["gmailMicrosecondCases"]:
+            args = {"startAt": (base + timedelta(microseconds=case["startOffsetMicros"])).isoformat().replace("+00:00", "Z"),
+                    "endAt": (base + timedelta(microseconds=case["endOffsetMicros"])).isoformat().replace("+00:00", "Z"),
+                    "maxItems": 100}
+            google_args(args)
+            fixture = dict(self.fixture, args=args)
+            request = {"toolName": GOOGLE_TOOLS[0], "args": args}
+            for record in case["records"]:
+                with self.subTest(case=case["name"], record=record["id"]):
+                    item = {"id": record["id"], "sender": "Synthetic sender", "subject": "Synthetic edge",
+                            "receivedAt": stamp(base + timedelta(milliseconds=record["offsetMillis"])),
+                            "unread": False, "sourceUrl": f'https://mail.google.com/mail/u/0/#inbox/{record["id"]}'}
+                    data = calendar_result(fixture, [item]); data["kind"] = "gmailMetadata"
+                    if record["included"]: google_result(data, request)
+                    else:
+                        with self.assertRaises(Fault): google_result(data, request)
+
+    def test_calendar_id_expansion_does_not_change_gmail_limit(self):
+        request = dict(self.request, toolName=GOOGLE_TOOLS[0])
+        data = calendar_result(self.fixture, [{"id": "a" * 256, "sender": "Synthetic sender",
+            "subject": "Synthetic subject", "receivedAt": "2026-09-02T00:00:00Z",
+            "unread": False, "sourceUrl": "https://mail.google.com/mail/u/0/#inbox/abc"}])
+        data["kind"] = "gmailMetadata"
+        google_result(data, request)
+        data["items"][0]["id"] += "a"
+        with self.assertRaises(Fault): google_result(data, request)
+
+    def test_date_and_timestamp_shapes_do_not_cross_all_day_boundary(self):
+        item = dict(self.fixture["cases"][0]["nativeItem"])
+        for start, end, all_day in [
+            ("2026-09-02T00:00:00Z", "2026-09-03T00:00:00Z", True),
+            ("2026-09-02", "2026-09-03", False),
+            ("2026-09-02", "2026-09-03T00:00:00Z", True),
+            ("2026-9-02", "2026-09-03", True),
+            ("２０２６-09-02", "2026-09-03", True),
+            ("2026-09-02", "2026-09-03", 1),
+            (None, "2026-09-03", True),
+            ("2026-09-02T09:00:00+24:00", "2026-09-03T00:00:00Z", False),
+            ("2026-09-02T09:00:00+0130", "2026-09-03T00:00:00Z", False),
+        ]:
+            with self.subTest(start=start, all_day=all_day):
+                data = calendar_result(self.fixture, [dict(item, startAt=start, endAt=end, allDay=all_day)])
+                with self.assertRaises(Fault): google_result(data, self.request)
+        self.assertEqual(calendar_date("2024-02-29"), date(2024, 2, 29))
+        with self.assertRaises(Fault): calendar_date("2025-02-29")
+
+    def test_timed_overlap_uses_instants_and_exclusive_request_edges(self):
+        item = dict(self.fixture["cases"][3]["nativeItem"])
+        for start, end, accepted in [
+            ("2026-08-31T23:30:00-01:00", "2026-09-01T00:30:00-01:00", True),
+            ("2026-09-08T00:30:00+01:00", "2026-09-08T01:30:00+01:00", True),
+            ("2026-08-31T22:00:00-01:00", "2026-08-31T23:00:00-01:00", False),
+            ("2026-09-08T01:00:00+01:00", "2026-09-08T02:00:00+01:00", False),
+            ("2026-08-29T00:00:00Z", "2026-08-30T00:00:00Z", False),
+        ]:
+            with self.subTest(start=start, end=end):
+                data = calendar_result(self.fixture, [dict(item, startAt=start, endAt=end)])
+                if accepted: google_result(data, self.request)
+                else:
+                    with self.assertRaises(Fault): google_result(data, self.request)
+        self.assertLess(calendar_instant("2026-09-02T09:00:00.123456788+01:00"),
+                        calendar_instant("2026-09-02T08:00:00.123456789Z"))
+        self.assertEqual(calendar_instant("2026-09-02T09:00:00.123+01:00"),
+                         calendar_instant("2026-09-02T08:00:00.123000000Z"))
+
+    def test_request_bounds_and_minimal_fields_remain_closed(self):
+        self.assertEqual(google_args(self.fixture["args"]), self.fixture["args"])
+        for change in [{"maxItems": 101}, {"maxItems": 0},
+                       {"endAt": "2026-09-08T00:00:00.001Z"},
+                       {"startAt": "2026-09-01T00:00:00+00:00"}, {"calendarId": "other"}]:
+            with self.subTest(change=change):
+                with self.assertRaises(Fault): google_args(dict(self.fixture["args"], **change))
+        data = calendar_result(self.fixture, [self.fixture["cases"][0]["nativeItem"]])
+        for key in ["description", "attendees", "timeZone", "access_token"]:
+            changed = copy.deepcopy(data); changed["items"][0][key] = "forbidden"
+            with self.subTest(key=key):
+                with self.assertRaises(Fault): google_result(changed, self.request)
+        with self.assertRaises(Fault):
+            google_result(data, dict(self.request, args=dict(self.fixture["args"], maxItems=0)))
+        for value in ["2026-09-02", "2026-09-02T09:00:00+01:00"]:
+            with self.assertRaises(Fault): instant(value)
+
+
 class WorkerTransportCase(unittest.TestCase):
     def test_client_and_transport_ignore_ambient_certificate_configuration(self):
         source = Path(__file__).resolve().parents[1] / "forma_runtime" / "worker.py"
@@ -245,6 +387,30 @@ class StoreCase(unittest.TestCase):
                   "error": {"code": "offline", "message": "Synthetic host offline"}}
         with self.assertRaises(Fault): self.post(f'/v1/runs/{run["id"]}/tool-result', result)
         self.assertNotIn("_result", self.store.get("tool", wait["_waitRequest"]))
+
+    def test_calendar_native_fixture_claim_delivery_preserves_data_and_live_gate(self):
+        fixture = calendar_fixture()
+        body = {"workspaceId": WORKSPACE, "connectionId": CONNECTION, "deviceId": DEVICE,
+                "operations": [GOOGLE_TOOLS[1]], "modelId": "synthetic-model",
+                "expiresAt": stamp(datetime.now(UTC) + timedelta(hours=1)), "dataMode": "synthetic"}
+        with self.assertRaises(Fault): self.post("/v1/grants", dict(body, dataMode="live"))
+        grant = self.post("/v1/grants", body)
+        run = self.start(run_body(grants=[{"id": grant["id"], "generation": 1}]))
+        wait = self.store.tool(run["id"], GOOGLE_TOOLS[1], fixture["args"])
+        request_id = wait["_waitRequest"]
+        claim = self.post(f'/v1/runs/{run["id"]}/tool-claim', {"requestId": request_id})
+        data = calendar_result(fixture, [case["nativeItem"] for case in fixture["cases"]
+                                         if case["accepted"] and "args" not in case])
+        result = {"requestId": request_id, "claimToken": claim["claimToken"], "outcome": "succeeded", "data": data}
+        malformed = copy.deepcopy(result)
+        malformed["data"]["items"][0]["endAt"] = malformed["data"]["items"][0]["startAt"]
+        with self.assertRaises(Fault): self.post(f'/v1/runs/{run["id"]}/tool-result', malformed)
+        self.assertNotIn("_result", self.store.get("tool", request_id))
+        self.assertEqual(self.store.get("run", run["id"])["state"], "waiting_for_device")
+        accepted = self.post(f'/v1/runs/{run["id"]}/tool-result', result)
+        self.assertEqual(accepted, {"accepted": True, "requestId": request_id})
+        self.assertEqual(self.store.tool_result(run["id"], request_id)["data"], data)
+        self.assertEqual(self.post(f'/v1/runs/{run["id"]}/tool-result', result), accepted)
 
     def test_invalid_worker_history_is_atomic_and_never_replayed(self):
         bad_messages = [

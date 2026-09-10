@@ -48,21 +48,16 @@ export function Accounts({ browser }: { browser: OwnedBrowser }) {
       signIn.current.focus();
       cancelHadFocus.current = false;
     }
-  }, [connectors.pending, connectors.busy, browser.busy]);
-  const disabled = !browser.native || !browser.status.available || browser.busy || connectors.busy || !capabilities.googleAvailable;
+  }, [connectors.pending, connectors.busy]);
+  const disabled = !browser.native || connectors.busy || !capabilities.googleAvailable;
   const detail = connectors.pending
-    ? (connectors.attempt?.phase === 'exchanging' ? 'Finishing Google sign-in…' : 'Waiting for Google sign-in…')
+    ? (connectors.attempt?.phase === 'exchanging' ? 'Finishing Google sign-in…' : 'Continue Google sign-in in your default browser…')
     : !capabilities.googleAvailable
       ? (capabilities.disabledReason || 'Google OAuth client not configured yet.')
       : googleAccounts.length > 0
         ? 'Add another Google account'
         : 'Request Gmail metadata & Calendar read-only permissions';
-  const startSignIn = async () => {
-    const response = await connectors.startGoogle(capabilities.defaultScopes.length ? capabilities.defaultScopes : GOOGLE_DEFAULT_SCOPES);
-    if (response && !await browser.open('custom', response.authorizeUrl)) {
-      await connectors.cancel(response.attemptId);
-    }
-  };
+  const startSignIn = () => connectors.startGoogle(capabilities.defaultScopes.length ? capabilities.defaultScopes : GOOGLE_DEFAULT_SCOPES);
   return <div className="browser-connections">
     <div className="account-row connector-row">
       <span className="account-icon"><GoogleLogo size={20} /></span>
@@ -72,6 +67,7 @@ export function Accounts({ browser }: { browser: OwnedBrowser }) {
         onFocus={() => { cancelHadFocus.current = true; }} onBlur={() => { cancelHadFocus.current = false; }}
         onClick={() => { void connectors.cancel(); }}>{connectors.cancelling ? 'Cancelling…' : 'Cancel'}</button>}
     </div>
+    <p className="field-note">Google sign-in opens your default browser, not the Forma browser. Forma never reads or copies that browser’s cookies or profiles. Mail and calendar reading is not available yet.</p>
     {googleAccounts.map(item => <GoogleAccountRow key={item.id} item={item} controller={connectors} />)}
     {connectors.cleanupIds.map(id => <div className="account-row connector-row" key={id}>
       <span className="account-icon"><GoogleLogo size={20} /></span>
@@ -202,7 +198,7 @@ export function Onboarding({ store, settings, browser, onSettings }: { store: Ap
         <div className="onboarding-copy"><span className="eyebrow">WELCOME TO FORMA</span><h1 id="onboarding-title">Set up your space.</h1><p>Keep your chats, browse your services, and choose the AI you use.</p></div>
       </>}
       {step === 1 && <div className="onboarding-copy accounts-step">
-        <span className="step-symbol"><EnvelopeSimple size={27} /></span><h1 id="onboarding-title">Sign in to your services.</h1><p>Use your Forma browser. Its sessions stay separate from your normal browsing.</p>
+        <span className="step-symbol"><EnvelopeSimple size={27} /></span><h1 id="onboarding-title">Sign in to your services.</h1><p>Connect Google through your default browser, or browse services separately in Forma.</p>
         <Accounts browser={browser} /><ProviderSetup store={store} settings={settings} onBusyChange={setBusy} />
       </div>}
       {step === 2 && <div className="onboarding-copy start-step">

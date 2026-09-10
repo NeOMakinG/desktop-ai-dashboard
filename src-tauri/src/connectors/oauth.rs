@@ -258,6 +258,30 @@ mod tests {
     }
 
     #[test]
+    fn authorize_endpoint_and_parameters_cannot_be_replaced_by_encoded_input() {
+        let input = "x&redirect_uri=https://attacker.invalid/#fragment ü";
+        let url = reqwest::Url::parse(&authorize_url(
+            input,
+            "http://127.0.0.1:5555/oauth2/google/callback",
+            &[input.into()],
+            input,
+            input,
+        )).unwrap();
+        assert_eq!(url.origin().ascii_serialization(), "https://accounts.google.com");
+        assert_eq!(url.path(), "/o/oauth2/v2/auth");
+        assert!(url.fragment().is_none());
+        assert!(url.username().is_empty());
+        let pairs: Vec<_> = url.query_pairs().collect();
+        assert_eq!(pairs.len(), 9);
+        for key in ["client_id", "scope", "state", "code_challenge"] {
+            assert_eq!(pairs.iter().filter(|(name, _)| name == key).count(), 1);
+            assert_eq!(pairs.iter().find(|(name, _)| name == key).unwrap().1, input);
+        }
+        assert_eq!(pairs.iter().find(|(name, _)| name == "redirect_uri").unwrap().1,
+            "http://127.0.0.1:5555/oauth2/google/callback");
+    }
+
+    #[test]
     fn parse_token_response_rejects_bad_shapes_and_secrets_shaped_wrong() {
         let ok = br#"{"access_token":"aaa","refresh_token":"rrr","expires_in":3600,"token_type":"Bearer","scope":"s"}"#;
         let parsed = parse_token_response(ok).unwrap();

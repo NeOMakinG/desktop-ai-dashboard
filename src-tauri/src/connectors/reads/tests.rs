@@ -284,6 +284,158 @@ async fn calendar_fixed_primary_fields_window_pagination_and_all_day_semantics()
     assert!(pairs(&requests[1].url).contains(&("maxResults".into(), "1".into())));
     assert!(pairs(&requests[1].url).contains(&("pageToken".into(), "opaque+/page".into())));
 }
+fn calendar_contract_fixture() -> serde_json::Value {
+    serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../runtime/tests/fixtures/calendar-native-results.json"
+    )))
+    .unwrap()
+}
+
+#[tokio::test]
+async fn read_request_shared_utc_microsecond_and_exact_window_bounds() {
+    let fixture = calendar_contract_fixture();
+    for case in fixture["requestCases"].as_array().unwrap() {
+        let (core, mut context, _) = setup(ReadOperation::CalendarListEvents);
+        context.args = case["args"].clone();
+        let transport = FixtureTransport::new(vec![json!({"items": []})]);
+        let result = dispatch(&core, context, &transport, "fixture-client").await;
+        assert_eq!(
+            result.is_ok(),
+            case["accepted"].as_bool().unwrap(),
+            "{}",
+            case["name"]
+        );
+        assert_eq!(
+            transport.calls.load(Ordering::SeqCst),
+            usize::from(case["accepted"] == true)
+        );
+    }
+}
+
+#[tokio::test]
+async fn gmail_shared_microsecond_window_edges_do_not_truncate_to_milliseconds() {
+    let fixture = calendar_contract_fixture();
+    for case in fixture["gmailMicrosecondCases"].as_array().unwrap() {
+        let (core, mut context, _) = setup(ReadOperation::GmailListMetadata);
+        let base =
+            chrono::DateTime::from_timestamp_millis(chrono::Utc::now().timestamp_millis() - 60_000)
+                .unwrap();
+        let start =
+            base + chrono::Duration::microseconds(case["startOffsetMicros"].as_i64().unwrap());
+        let end = base + chrono::Duration::microseconds(case["endOffsetMicros"].as_i64().unwrap());
+        context.args = json!({"startAt": start.to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+            "endAt": end.to_rfc3339_opts(chrono::SecondsFormat::Micros, true), "maxItems": 100});
+        let records = case["records"].as_array().unwrap();
+        let mut responses = vec![
+            json!({"messages": records.iter().map(|r| json!({"id": r["id"]})).collect::<Vec<_>>()}),
+        ];
+        let mut expected = Vec::new();
+        for record in records {
+            let id = record["id"].as_str().unwrap();
+            let mut metadata = message(id, -60);
+            metadata["internalDate"] = json!((base.timestamp_millis()
+                + record["offsetMillis"].as_i64().unwrap())
+            .to_string());
+            responses.push(metadata);
+            if record["included"] == true {
+                expected.push(record["id"].clone());
+            }
+        }
+        let transport = FixtureTransport::new(responses);
+        let result = dispatch(&core, context, &transport, "fixture-client")
+            .await
+            .unwrap();
+        let value = safe_result(&result);
+        let actual: Vec<_> = value["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["id"].clone())
+            .collect();
+        assert_eq!(actual, expected, "{}", case["name"]);
+        assert_eq!(transport.calls.load(Ordering::SeqCst), 1 + records.len());
+    }
+}
+
+#[tokio::test]
+async fn calendar_native_projection_matches_shared_python_validator_fixtures() {
+    let fixture = calendar_contract_fixture();
+    for case in fixture["cases"].as_array().unwrap() {
+        let (core, mut context, _) = setup(ReadOperation::CalendarListEvents);
+        context.args = case.get("args").unwrap_or(&fixture["args"]).clone();
+        let transport = FixtureTransport::new(vec![json!({"items": [case["providerEvent"]]})]);
+        let result = dispatch(&core, context.clone(), &transport, "fixture-client").await;
+        if case["accepted"] == true {
+            let result = result.unwrap_or_else(|e| panic!("{}: {}", case["name"], e.code));
+            let expected = json!({
+                "kind": "calendarEvents",
+                "retrievedAt": result.retrieved_at,
+                "expiresAt": context.expires_at,
+                "startAt": context.args["startAt"],
+                "endAt": context.args["endAt"],
+                "truncated": false,
+                "partial": false,
+                "items": [case["nativeItem"]]
+            });
+            assert_eq!(safe_result(&result), expected, "{}", case["name"]);
+        } else if case["filtered"] == true {
+            assert_eq!(
+                safe_result(&result.unwrap())["items"],
+                json!([]),
+                "{}",
+                case["name"]
+            );
+        } else {
+            assert!(result.is_err(), "{}", case["name"]);
+        }
+        assert_eq!(transport.calls.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+async fn calendar_shared_fixture_count_and_byte_limits() {
+    let fixture = calendar_contract_fixture();
+    for case in fixture["sizeCases"].as_array().unwrap() {
+        let (core, mut context, _) = setup(ReadOperation::CalendarListEvents);
+        context.args = fixture["args"].clone();
+        let mut provider_items = Vec::new();
+        let mut native_items = Vec::new();
+        for index in 0..case["count"].as_u64().unwrap() {
+            let mut provider = fixture["cases"][0]["providerEvent"].clone();
+            let mut native = fixture["cases"][0]["nativeItem"].clone();
+            let id = json!(match case["idLength"].as_u64() {
+                Some(length) => "a".repeat(length as usize),
+                None => format!("size_{index}"),
+            });
+            provider["id"] = id.clone();
+            native["id"] = id;
+            if let Some(repeat) = case["titleRepeat"].as_u64() {
+                let title = json!(case["titleCharacter"]
+                    .as_str()
+                    .unwrap()
+                    .repeat(repeat as usize));
+                provider["summary"] = title.clone();
+                native["title"] = title;
+            }
+            provider_items.push(provider);
+            native_items.push(native);
+        }
+        let transport = FixtureTransport::new(vec![json!({"items": provider_items})]);
+        let result = dispatch(&core, context, &transport, "fixture-client").await;
+        if case["accepted"] == true {
+            assert_eq!(
+                safe_result(&result.unwrap())["items"],
+                json!(native_items),
+                "{}",
+                case["name"]
+            );
+        } else {
+            assert!(result.is_err(), "{}", case["name"]);
+        }
+    }
+}
+
 #[tokio::test]
 async fn no_network_for_wrong_scope_identity_generation_egress_expiry_or_unknown_args() {
     let (core, context, _) = setup(ReadOperation::GmailListMetadata);
