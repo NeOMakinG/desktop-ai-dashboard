@@ -13,7 +13,9 @@ A calm, open-source desktop app for conversations that remember. Each workspace 
 - Native SQLite storage and endpoint-bound OS credential storage, with no plaintext key fallback.
 - A searchable model picker in chat, with runtime discovery and remembered selections.
 - Automatic initial model selection prefers the newest available Opus; explicit choices are preserved.
-- Explicit provider checks and nonstreaming text replies through the native host.
+- Explicit provider checks and nonstreaming replies through the native host.
+- Bounded trusted assistant blocks: inert markdown, cards, lists, key/value rows, and callouts, with raw-text fallback. These are not executable custom interfaces; card links are noninteractive.
+- An isolated, persistent Forma-owned WebKit browser on macOS 14 or later, separate from the privileged app and normal browser profiles.
 - Browser evaluation with local chat persistence, but no native credentials or provider calls.
 - Tauri desktop shell using the OS webview, not Electron.
 
@@ -51,7 +53,11 @@ Choose your own compatible provider in Settings. Keys stay in the native credent
 
 Sending a message transmits that workspace's relevant conversation to the provider you selected. “Stored on your device” does not mean “no model-provider egress.” There are no connected mailbox, calendar, browser, or filesystem tools in the current chat route.
 
-Google/Apple account access, a persistent Forma-owned browser, explicitly attached browsers, Hermes tools, generated custom interfaces, MCP, paired desktop hosts, and mobile clients are in the [product vision](docs/product/vision.md). They must not be inferred from the alpha's provider connection. See the [domain glossary](CONTEXT.md) for the current meaning of workspace, connection, and device.
+The owned browser currently uses WebKit. Managed system Chromium is intentionally unavailable until network blocking can be enforced before startup traffic; Chromium navigation and Google-login compatibility are not verified.
+
+Google OAuth plumbing requires a build-time `FORMA_GOOGLE_CLIENT_ID`. Without a registered client, sign-in is visibly disabled. Real sign-in, the applicable Google policy/compliance gates, and connected-account runtime QA remain unverified. Local disconnection does not revoke access at Google. Neither browser sign-in nor OAuth plumbing gives the model Gmail, Calendar, or browser tools.
+
+Apple account access, explicitly attached browsers, Hermes tools, genuinely generated custom interfaces, MCP, paired desktop hosts, and mobile clients remain in the [product vision](docs/product/vision.md). They must not be inferred from trusted component replies or the alpha's provider connection. See the [domain glossary](CONTEXT.md) for the current meaning of workspace, connection, and device.
 
 ## Design and media
 
@@ -64,7 +70,7 @@ The earlier visual prototype remains available at `/prototype` in development on
 ```sh
 pnpm typecheck
 pnpm build
-node --experimental-transform-types --input-type=module -e "import('./src/app/store.regression.ts').then(async m => console.log(await m.runStoreRegressionChecks()))"
+npm test
 CARGO_BUILD_JOBS=2 cargo test --manifest-path src-tauri/Cargo.toml
 cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
 ```

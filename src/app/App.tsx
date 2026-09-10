@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, useSyncExternalStore, type FormEvent } fro
 import {
   ArrowDown, ArrowRight, ArrowUp, ChatCircle, Check, DotsThree,
   EnvelopeSimple, GearSix, MagnifyingGlass, PencilSimple, Plus, SidebarSimple,
-  Sparkle, Square, Trash, X, CalendarBlank, Compass,
+  Sparkle, Square, Trash, X, CalendarBlank, Compass, Browser as BrowserIcon,
 } from '@phosphor-icons/react';
 import { motion, useReducedMotion } from 'motion/react';
 import { createBridge, friendlyError } from './bridge';
@@ -10,6 +10,9 @@ import { AppStore, type AppSnapshot } from './store';
 import { AmbientMedia, IconButton, InlineError, Logo, Modal, SafeImage } from './components';
 import { Onboarding, Settings } from './Settings';
 import { ModelSelector } from './ModelSelector';
+import { AssistantMessageContent } from './message';
+import { BrowserView } from './BrowserView';
+import { useOwnedBrowser } from './owned-browser';
 import type { ChatMessage, WorkspaceSummary } from './contracts';
 import { media } from './media';
 import './app.css';
@@ -52,7 +55,7 @@ function Message({ message, onRetry, pending }: { message: ChatMessage; onRetry:
   return <article className="message assistant-message" aria-label="Forma reply">
     <Logo compact />
     <div className="assistant-body">
-      {message.status === 'complete' ? <div className="message-text">{message.content}</div>
+      {message.status === 'complete' ? <AssistantMessageContent message={message} />
         : message.status === 'pending' && pending ? <div className="reply-pending" role="status"><span className="thinking-dots"><i /><i /><i /></span><span>Thinking it through…</span></div>
           : <div className="reply-interrupted"><span>{message.status === 'cancelled' ? 'Reply stopped.' : 'This reply didn’t finish.'}</span><button type="button" className="text-button" onClick={onRetry}>Edit & retry <ArrowRight size={14} /></button></div>}
     </div>
@@ -99,13 +102,14 @@ function WorkspaceDialog({ mode, workspace, store, onClose }: { mode: 'rename' |
   </Modal>;
 }
 
-function CommandPalette({ state, store, onClose, onSettings }: { state: AppSnapshot; store: AppStore; onClose: () => void; onSettings: () => void }) {
+function CommandPalette({ state, store, onClose, onSettings, onChat, onBrowser }: { state: AppSnapshot; store: AppStore; onClose: () => void; onSettings: () => void; onChat: () => void; onBrowser: () => void }) {
   const [query, setQuery] = useState('');
   const [index, setIndex] = useState(0);
   const actions = [
-    { id: 'new', label: 'New workspace', icon: Plus, shortcut: '⇧⌘N', run: () => { void store.newWorkspace().catch(() => {}); } },
+    { id: 'new', label: 'New workspace', icon: Plus, shortcut: '⇧⌘N', run: () => { onChat(); void store.newWorkspace().catch(() => {}); } },
+    { id: 'browser', label: 'Your browser', icon: BrowserIcon, shortcut: '', run: onBrowser },
     { id: 'settings', label: 'Settings', icon: GearSix, shortcut: '', run: onSettings },
-    ...state.workspaces.map(workspace => ({ id: workspace.id, label: workspace.title, icon: ChatCircle, shortcut: '', run: () => { void store.selectWorkspace(workspace.id).catch(() => {}); } })),
+    ...state.workspaces.map(workspace => ({ id: workspace.id, label: workspace.title, icon: ChatCircle, shortcut: '', run: () => { onChat(); void store.selectWorkspace(workspace.id).catch(() => {}); } })),
   ].filter(action => action.label.toLocaleLowerCase().includes(query.toLocaleLowerCase()));
   const choose = (choice: number) => { const action = actions[choice]; if (action) { onClose(); action.run(); } };
   return <Modal title="Find your space" onClose={onClose} className="command-modal">
@@ -155,6 +159,8 @@ function useLifecycle(store: AppStore) {
 export function App() {
   const [store] = useState(() => new AppStore(createBridge()));
   const state = useSyncExternalStore(store.subscribe, store.getSnapshot);
+  const browser = useOwnedBrowser(store.bridge.native);
+  const [view, setView] = useState<'chat' | 'browser'>('chat');
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
@@ -178,46 +184,48 @@ export function App() {
     if (input) { input.style.height = 'auto'; input.style.height = `${Math.min(input.scrollHeight, 180)}px`; }
   }, [state.draft, state.ready, state.settings?.onboardingComplete]);
   useEffect(() => { follow.current = true; setShowJump(false); }, [state.activeId]);
-  useEffect(() => { if (follow.current && scroll.current) scroll.current.scrollTop = scroll.current.scrollHeight; }, [state.workspace?.messages, state.pending, state.activeId]);
+  useEffect(() => { if (follow.current && scroll.current) scroll.current.scrollTop = scroll.current.scrollHeight; }, [state.workspace?.messages, state.pending, state.activeId, view]);
   useEffect(() => {
     const keydown = (event: KeyboardEvent) => {
       if (event.isComposing || document.querySelector('dialog[open]')) return;
       const target = event.target as HTMLElement;
       const editing = ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName) || target.isContentEditable;
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') { event.preventDefault(); setPaletteOpen(true); }
-      else if ((event.metaKey || event.ctrlKey) && event.shiftKey && event.key.toLowerCase() === 'n') { event.preventDefault(); void store.newWorkspace().then(focusComposer).catch(() => {}); }
-      else if (event.key === '/' && !editing) { event.preventDefault(); focusComposer(); }
+      else if ((event.metaKey || event.ctrlKey) && event.shiftKey && event.key.toLowerCase() === 'n') { event.preventDefault(); setView('chat'); void store.newWorkspace().then(focusComposer).catch(() => {}); }
+      else if (event.key === '/' && !editing) { event.preventDefault(); if (view === 'browser') document.querySelector<HTMLInputElement>('[aria-label="Website address"]')?.focus(); else focusComposer(); }
       else if (event.key === '?' && !editing) { event.preventDefault(); setShortcutsOpen(true); }
-      else if (event.key === 'Escape') { if (state.pending) store.cancel(); setSidebarOpen(false); }
+      else if (event.key === 'Escape') { if (view === 'chat' && state.pending) store.cancel(); setSidebarOpen(false); }
     };
     if (state.settings?.onboardingComplete) window.addEventListener('keydown', keydown);
     return () => window.removeEventListener('keydown', keydown);
-  }, [state.pending, state.settings?.onboardingComplete, store]);
+  }, [state.pending, state.settings?.onboardingComplete, store, view]);
 
   if (!state.ready || !state.settings) return <main className="startup-screen"><Logo /><div className="startup-content">{state.error ? <><h1>Your space is still here.</h1><InlineError onRetry={() => void store.initialise()}>{state.error}</InlineError></> : <><div className="skeleton skeleton-title" /><div className="skeleton skeleton-line" /><span className="sr-only" role="status">Opening your workspaces</span></>}</div></main>;
   const settings = state.settings;
-  const settingsModal = settingsOpen && <Settings store={store} settings={settings} onClose={() => { setSettingsOpen(false); focusComposer(); }} />;
-  if (!settings.onboardingComplete) return <><Onboarding store={store} settings={settings} onSettings={() => setSettingsOpen(true)} />{settingsModal}</>;
+  const settingsModal = settingsOpen && <Settings store={store} settings={settings} browser={browser} onClose={() => { setSettingsOpen(false); if (view === 'chat') focusComposer(); }} />;
+  if (!settings.onboardingComplete) return <><Onboarding store={store} settings={settings} browser={browser} onSettings={() => setSettingsOpen(true)} />{settingsModal}</>;
   const workspace = state.workspace;
   const empty = !workspace?.messages.length;
   return <div className={`app-shell ${sidebarOpen ? 'sidebar-is-open' : ''}`}>
-    <a className="skip-link" href="#chat-composer">Skip to chat</a>
+    <a className="skip-link" href={view === 'browser' ? '#browser-title' : '#chat-composer'}>Skip to {view === 'browser' ? 'browser' : 'chat'}</a>
     {sidebarOpen && <button type="button" className="sidebar-scrim" aria-label="Close workspace sidebar" onClick={() => setSidebarOpen(false)} />}
     <aside className="app-sidebar" aria-label="Workspaces">
       <div className="sidebar-brand"><Logo /><IconButton label="Find a workspace (⌘K)" onClick={() => setPaletteOpen(true)}><MagnifyingGlass size={18} /></IconButton></div>
-      <button className="new-chat-button" type="button" title="New workspace (⌘⇧N)" disabled={state.navigating || state.closing} onClick={() => { void store.newWorkspace().then(focusComposer).catch(() => {}); setSidebarOpen(false); }}><Plus size={19} /><span>New workspace</span><kbd>⇧⌘N</kbd></button>
+      <button className="new-chat-button" type="button" title="New workspace (⌘⇧N)" disabled={state.navigating || state.closing} onClick={() => { setView('chat'); void store.newWorkspace().then(focusComposer).catch(() => {}); setSidebarOpen(false); }}><Plus size={19} /><span>New workspace</span><kbd>⇧⌘N</kbd></button>
+      <button type="button" className={`browser-nav ${view === 'browser' ? 'selected' : ''}`} aria-current={view === 'browser' ? 'page' : undefined} disabled={state.closing} onClick={() => { setView('browser'); setSidebarOpen(false); }}><BrowserIcon size={19} /><span>Browser</span></button>
       <div className="history-heading"><span>Your workspaces</span><span>{state.workspaces.length}</span></div>
-      <nav className="workspace-history" aria-label="Past workspaces">{state.workspaces.map(item => <button type="button" key={item.id} className={`history-item ${state.activeId === item.id ? 'selected' : ''}`} aria-current={state.activeId === item.id ? 'page' : undefined}
-        disabled={state.navigating || state.closing} onClick={() => { void store.selectWorkspace(item.id).then(focusComposer).catch(() => {}); setSidebarOpen(false); }} title={item.title}>
+      <nav className="workspace-history" aria-label="Past workspaces">{state.workspaces.map(item => <button type="button" key={item.id} className={`history-item ${view === 'chat' && state.activeId === item.id ? 'selected' : ''}`} aria-current={view === 'chat' && state.activeId === item.id ? 'page' : undefined}
+        disabled={state.navigating || state.closing} onClick={() => { setView('chat'); void store.selectWorkspace(item.id).then(focusComposer).catch(() => {}); setSidebarOpen(false); }} title={item.title}>
         <ChatCircle size={17} /><span><span className="history-title">{item.title}</span><time dateTime={item.updatedAt} title={new Date(item.updatedAt).toLocaleString()}>{quietDate(item.updatedAt)}</time></span>
       </button>)}</nav>
       <div className="sidebar-bottom"><button type="button" className="profile-button" onClick={() => setSettingsOpen(true)}><span className="profile-avatar">{settings.displayName ? Array.from(settings.displayName)[0].toLocaleUpperCase() : <Sparkle size={17} />}</span><span>{settings.displayName || 'Your space'}<small>Settings & connections</small></span><GearSix size={17} /></button></div>
     </aside>
     <main className="chat-canvas" id="main-content">
       <header className="chat-topbar" data-tauri-drag-region>
-        <div className="topbar-title"><IconButton className="mobile-sidebar-toggle" label="Show workspaces" onClick={() => setSidebarOpen(true)}><SidebarSimple size={20} /></IconButton><span>{workspace?.title || 'Your space'}</span></div>
-        <div className="topbar-actions">{state.navigating && <span className="quiet-status" role="status">Opening…</span>}{workspace && <WorkspaceMenu onRename={() => setWorkspaceDialog({ mode: 'rename', workspace })} onDelete={() => setWorkspaceDialog({ mode: 'delete', workspace })} />}</div>
+        <div className="topbar-title"><IconButton className="mobile-sidebar-toggle" label="Show workspaces" onClick={() => setSidebarOpen(true)}><SidebarSimple size={20} /></IconButton><span>{view === 'browser' ? 'Browser' : workspace?.title || 'Your space'}</span></div>
+        <div className="topbar-actions">{state.navigating && <span className="quiet-status" role="status">Opening…</span>}{view === 'chat' && workspace && <WorkspaceMenu onRename={() => setWorkspaceDialog({ mode: 'rename', workspace })} onDelete={() => setWorkspaceDialog({ mode: 'delete', workspace })} />}</div>
       </header>
+      {view === 'browser' ? <BrowserView browser={browser} /> : <>
       {state.error && <div className="global-error"><InlineError>{state.error}</InlineError><IconButton label="Dismiss notice" onClick={store.clearError}><X size={16} /></IconButton></div>}
       <div className={`chat-scroll ${empty ? 'is-empty' : ''}`} ref={scroll} onScroll={() => { const element = scroll.current; if (element) { follow.current = element.scrollHeight - element.scrollTop - element.clientHeight < 100; setShowJump(!follow.current); } }}>
         <div className="chat-width">{empty ? <EmptyChat name={settings.displayName} motionEnabled={settings.ambientMotion} onExample={fillComposer} />
@@ -244,9 +252,10 @@ export function App() {
         </form>
         <div className="composer-footer"><span role="status">{state.closing ? 'Keeping your work safe before closing…' : state.saving || state.dirty ? 'Remembering your draft…' : <><Check size={12} />Remembered on this device</>}</span><button type="button" onClick={() => setShortcutsOpen(true)} title="Keyboard shortcuts (?)">Keyboard shortcuts <kbd>?</kbd></button></div>
       </div></div>
+      </>}
     </main>
     {settingsModal}
-    {paletteOpen && <CommandPalette state={state} store={store} onClose={() => setPaletteOpen(false)} onSettings={() => setSettingsOpen(true)} />}
+    {paletteOpen && <CommandPalette state={state} store={store} onClose={() => setPaletteOpen(false)} onSettings={() => setSettingsOpen(true)} onChat={() => setView('chat')} onBrowser={() => setView('browser')} />}
     {workspaceDialog && <WorkspaceDialog mode={workspaceDialog.mode} workspace={workspaceDialog.workspace} store={store} onClose={() => setWorkspaceDialog(null)} />}
     {shortcutsOpen && <Modal title="A few handy shortcuts" onClose={() => setShortcutsOpen(false)} className="shortcuts-modal"><dl>{[['Find a workspace', '⌘ / Ctrl K'], ['New workspace', '⌘ / Ctrl ⇧ N'], ['Focus your message', '/'], ['Send a message', 'Enter'], ['Add a new line', 'Shift Enter'], ['Close a dialog / stop a reply', 'Esc']].map(([label, key]) => <div key={label}><dt>{label}</dt><dd><kbd>{key}</kbd></dd></div>)}</dl></Modal>}
   </div>;

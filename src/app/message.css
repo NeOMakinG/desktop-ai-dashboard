@@ -1,0 +1,32 @@
+.message-raw { white-space: pre-wrap; overflow-wrap: anywhere; }
+.message-blocks { display: flex; flex-direction: column; gap: 12px; min-width: 0; width: 100%; color: var(--ink); font-size: 16px; line-height: 1.5; overflow-wrap: anywhere; }
+.message-blocks p, .message-blocks ul, .message-blocks ol, .message-blocks dl, .message-blocks dd, .message-blocks pre { margin: 0; }
+.message-blocks [dir="auto"] { unicode-bidi: isolate; min-width: 0; }
+.message-card, .message-callout { display: flex; flex-direction: column; gap: 12px; min-width: 0; padding: 16px; border: 1px solid var(--border); border-radius: 16px; background: var(--panel); }
+.message-block-title { color: var(--ink); font-size: 16px; font-weight: 600; white-space: pre-wrap; }
+.message-block-prose { font-size: 16px; font-weight: 400; white-space: pre-wrap; }
+.message-block-detail, .message-block-empty, .message-actions, .message-kv, .message-callout-label { font-size: 14px; line-height: 1.5; }
+.message-block-detail, .message-block-empty, .message-action-url { color: var(--secondary); }
+.message-block-detail, .message-actions, .message-kv { white-space: pre-wrap; }
+.message-actions, .message-action { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.message-list { display: flex; flex-direction: column; gap: 8px; padding: 0; list-style: none; }
+.message-list > li { display: flex; align-items: flex-start; gap: 8px; min-width: 0; }
+.message-list > li > svg { flex: 0 0 auto; color: var(--secondary); }
+.message-list > li > div { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.message-kv { display: flex; flex-direction: column; gap: 8px; }
+.message-kv > div { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 2fr); gap: 16px; min-width: 0; }
+.message-kv dt { color: var(--secondary); }
+.message-kv dd { color: var(--ink); }
+.message-callout-label { color: var(--secondary); font-weight: 600; }
+.message-callout-warn { background: var(--error-bg); }
+.message-callout-warn .message-callout-label { color: var(--error-ink); }
+.message-callout-success .message-callout-label { color: var(--success); }
+.message-markdown { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+.message-markdown p, .message-markdown li { white-space: pre-wrap; }
+.message-markdown ul, .message-markdown ol { padding-inline-start: 24px; }
+.message-markdown li + li { margin-block-start: 8px; }
+.message-markdown pre { white-space: pre-wrap; overflow-wrap: anywhere; min-width: 0; }
+.message-markdown code { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 14px; color: var(--ink); }
+@media (max-width: 520px) {
+  .message-kv > div { grid-template-columns: minmax(0, 1fr); gap: 4px; }
+}

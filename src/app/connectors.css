@@ -1,0 +1,39 @@
+.connector-row .connector-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  margin-left: auto;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 550;
+  letter-spacing: .2px;
+}
+.connector-row .connector-badge + .connector-menu-anchor { margin-left: 8px; }
+.connector-menu-anchor { position: relative; display: inline-flex; }
+.connector-popover {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  z-index: 10;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px;
+  min-width: 160px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 12px 24px var(--composer-shadow);
+}
+.connector-popover .text-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px;
+  border-radius: 8px;
+  text-align: left;
+}
+.connector-popover .text-button:hover { background: var(--sidebar-hover); }

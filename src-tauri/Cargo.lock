@@ -1177,8 +1177,13 @@ dependencies = [
 name = "forma"
 version = "0.2.0"
 dependencies = [
+ "block2",
  "chrono",
  "keyring",
+ "libc",
+ "objc2",
+ "objc2-foundation",
+ "objc2-web-kit",
  "reqwest 0.12.28",
  "rusqlite",
  "serde",

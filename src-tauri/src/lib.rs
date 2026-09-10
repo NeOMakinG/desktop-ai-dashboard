@@ -1,4 +1,7 @@
+mod browser;
+mod connectors;
 mod core;
+mod hermes;
 mod provider;
 mod store;
 mod types;
@@ -184,6 +187,17 @@ pub fn run() {
                 .clone()
                 .map(Ok)
                 .unwrap_or_else(|| app.path().app_data_dir().map_err(|_| AppError::storage()));
+            app.manage(
+                browser::BrowserState::new(
+                    directory.as_ref().ok().cloned(),
+                    test_directory.is_some(),
+                )
+                .with_app(app.handle().clone()),
+            );
+            app.manage(connectors::ConnectorState::new(
+                directory.as_ref().ok().cloned(),
+                test_directory.clone(),
+            ));
             let native = directory
                 .and_then(|directory| store::Store::open(&directory))
                 .map(|store| {
@@ -197,7 +211,27 @@ pub fn run() {
             app.set_menu(tauri::menu::Menu::default(app.handle())?)?;
             Ok(())
         })
+        .on_window_event(|window, event| {
+            // Main's draft-flush handler destroys main once safe. Its owned window must
+            // not keep the process alive; destroying it does not clear WebKit storage.
+            if window.label() == "main" && matches!(event, tauri::WindowEvent::Destroyed) {
+                window
+                    .app_handle()
+                    .state::<browser::BrowserState>()
+                    .shutdown();
+                if let Some(browser) = window.app_handle().get_webview_window(browser::LABEL) {
+                    let _ = browser.destroy();
+                }
+            }
+        })
         .invoke_handler(tauri::generate_handler![
+            browser::browser_status,
+            browser::browser_open,
+            browser::browser_navigate,
+            browser::browser_close,
+            browser::browser_back,
+            browser::browser_forward,
+            browser::browser_reload,
             app_bootstrap,
             save_settings,
             configure_provider,
@@ -210,7 +244,14 @@ pub fn run() {
             delete_workspace,
             start_message,
             complete_message,
-            cancel_message
+            cancel_message,
+            connectors::connectors_status,
+            connectors::connectors_list,
+            connectors::connectors_cancel,
+            connectors::connectors_capabilities,
+            connectors::connectors_start_google,
+            connectors::connectors_refresh,
+            connectors::connectors_disconnect
         ])
         .build(tauri::generate_context!())
         .expect("Unable to start Forma")

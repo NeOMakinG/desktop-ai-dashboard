@@ -1,15 +1,85 @@
-import { useState, useSyncExternalStore } from 'react';
-import { ArrowRight, Browser, CalendarBlank, Check, CheckCircle, EnvelopeSimple, GearSix, LockSimple, Sparkle } from '@phosphor-icons/react';
+import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
+import { ArrowRight, ArrowSquareOut, Check, CheckCircle, EnvelopeSimple, GearSix, GoogleLogo, LockSimple, Sparkle, X } from '@phosphor-icons/react';
 import type { AppSettings } from './contracts';
 import type { AppStore } from './store';
 import { friendlyError } from './bridge';
 import { AmbientMedia, InlineError, Logo, Modal } from './components';
+import { BrowserConnections } from './BrowserView';
+import type { OwnedBrowser } from './owned-browser';
+import type { ConnectorStatus } from './browser-contracts';
+import { GOOGLE_DEFAULT_SCOPES, useConnectors, type ConnectorsController } from './connectors';
 
-export function Accounts() {
-  return <div className="accounts-list">
-    <div className="account-row"><span className="account-icon"><EnvelopeSimple size={20} /></span><span>Google<span className="row-detail">Mail & calendar</span></span><span className="availability">Not available yet</span></div>
-    <div className="account-row"><span className="account-icon"><CalendarBlank size={20} /></span><span>Apple<span className="row-detail">Calendar</span></span><span className="availability">Not available yet</span></div>
-    <div className="account-row"><span className="account-icon"><Browser size={20} /></span><span>Your browser<span className="row-detail">A connected browsing space</span></span><span className="availability">Not available yet</span></div>
+function GoogleAccountRow({ item, controller }: { item: ConnectorStatus; controller: ConnectorsController }) {
+  const [open, setOpen] = useState(false);
+  const anchor = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    if (!open) return;
+    const handler = (event: MouseEvent) => {
+      if (anchor.current && !anchor.current.contains(event.target as Node)) setOpen(false);
+    };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, [open]);
+  const scopeSummary = item.scopes.length === 1 ? '1 scope' : `${item.scopes.length} scopes`;
+  return <div className="account-row connector-row">
+    <span className="account-icon"><GoogleLogo size={20} /></span>
+    <span>Google account<span className="row-detail">Signed in · {scopeSummary}</span></span>
+    <span className="connector-badge" aria-label="Connected"><CheckCircle size={13} weight="fill" />Connected</span>
+    <div className="connector-menu-anchor" ref={anchor}>
+      <button type="button" className="text-button muted" aria-haspopup="menu" aria-expanded={open} disabled={controller.busy}
+        onClick={() => setOpen(value => !value)}>Manage</button>
+      {open && <div className="connector-popover" role="menu">
+        <button type="button" className="text-button" role="menuitem" disabled={controller.busy}
+          onClick={() => { setOpen(false); void controller.disconnect(item.id); }}><X size={14} />Disconnect</button>
+      </div>}
+    </div>
+  </div>;
+}
+
+export function Accounts({ browser }: { browser: OwnedBrowser }) {
+  const connectors = useConnectors(browser.native);
+  const googleAccounts = connectors.items.filter(item => item.provider === 'google');
+  const capabilities = connectors.capabilities;
+  const signIn = useRef<HTMLButtonElement | null>(null);
+  const cancelHadFocus = useRef(false);
+  useEffect(() => {
+    if (!connectors.pending && !connectors.busy && cancelHadFocus.current && signIn.current && !signIn.current.disabled) {
+      signIn.current.focus();
+      cancelHadFocus.current = false;
+    }
+  }, [connectors.pending, connectors.busy, browser.busy]);
+  const disabled = !browser.native || !browser.status.available || browser.busy || connectors.busy || !capabilities.googleAvailable;
+  const detail = connectors.pending
+    ? (connectors.attempt?.phase === 'exchanging' ? 'Finishing Google sign-in…' : 'Waiting for Google sign-in…')
+    : !capabilities.googleAvailable
+      ? (capabilities.disabledReason || 'Google OAuth client not configured yet.')
+      : googleAccounts.length > 0
+        ? 'Add another Google account'
+        : 'Request Gmail metadata & Calendar read-only permissions';
+  const startSignIn = async () => {
+    const response = await connectors.startGoogle(capabilities.defaultScopes.length ? capabilities.defaultScopes : GOOGLE_DEFAULT_SCOPES);
+    if (response && !await browser.open('custom', response.authorizeUrl)) {
+      await connectors.cancel(response.attemptId);
+    }
+  };
+  return <div className="browser-connections">
+    <div className="account-row connector-row">
+      <span className="account-icon"><GoogleLogo size={20} /></span>
+      <span>Google<span className="row-detail" role="status" aria-live="polite">{detail}</span></span>
+      <button ref={signIn} type="button" className="button secondary" disabled={disabled} onClick={() => { void startSignIn(); }}>Sign in <ArrowSquareOut size={14} /></button>
+      {connectors.pending && <button type="button" className="text-button" disabled={connectors.cancelling}
+        onFocus={() => { cancelHadFocus.current = true; }} onBlur={() => { cancelHadFocus.current = false; }}
+        onClick={() => { void connectors.cancel(); }}>{connectors.cancelling ? 'Cancelling…' : 'Cancel'}</button>}
+    </div>
+    {googleAccounts.map(item => <GoogleAccountRow key={item.id} item={item} controller={connectors} />)}
+    {connectors.cleanupIds.map(id => <div className="account-row connector-row" key={id}>
+      <span className="account-icon"><GoogleLogo size={20} /></span>
+      <span>Google credential cleanup<span className="row-detail">Disconnected locally. Credential cleanup is incomplete.</span></span>
+      <button type="button" className="text-button" disabled={connectors.busy} onClick={() => { void connectors.disconnect(id); }}>Retry cleanup</button>
+    </div>)}
+    {connectors.notice && <p className="field-note" role="status">{connectors.notice}</p>}
+    {connectors.error && <InlineError>{connectors.error}</InlineError>}
+    <BrowserConnections browser={browser} />
   </div>;
 }
 
@@ -77,7 +147,7 @@ function ProviderSetup({ store, settings, onBusyChange }: { store: AppStore; set
   );
 }
 
-export function Settings({ store, settings, onClose }: { store: AppStore; settings: AppSettings; onClose: () => void }) {
+export function Settings({ store, settings, browser, onClose }: { store: AppStore; settings: AppSettings; browser: OwnedBrowser; onClose: () => void }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [name, setName] = useState(settings.displayName);
@@ -97,7 +167,7 @@ export function Settings({ store, settings, onClose }: { store: AppStore; settin
       <label className="toggle-row"><span>Ambient motion<span className="row-detail">A little movement in your empty space</span></span>
         <input type="checkbox" role="switch" checked={settings.ambientMotion} disabled={busy} onChange={event => void save({ ambientMotion: event.target.checked })} /></label>
     </section>
-    <section className="settings-section"><h3>Accounts</h3><Accounts /></section>
+    <section className="settings-section"><h3>Accounts</h3><Accounts browser={browser} /></section>
     <section className="settings-section">
       <div className="section-heading"><h3>AI connection</h3><span className="availability">{settings.provider.verified ? 'Checked' : settings.provider.baseUrl ? 'Needs a check' : 'Not set up'}</span></div>
       {!store.bridge.native && <p className="browser-note"><LockSimple size={18} /><span>This browser preview saves chats and drafts locally. AI connections and secure keys are available in the desktop app.</span></p>}
@@ -109,7 +179,7 @@ export function Settings({ store, settings, onClose }: { store: AppStore; settin
   </Modal>;
 }
 
-export function Onboarding({ store, settings, onSettings }: { store: AppStore; settings: AppSettings; onSettings: () => void }) {
+export function Onboarding({ store, settings, browser, onSettings }: { store: AppStore; settings: AppSettings; browser: OwnedBrowser; onSettings: () => void }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const step = Math.min(2, Math.max(0, settings.onboardingStep));
@@ -121,18 +191,18 @@ export function Onboarding({ store, settings, onSettings }: { store: AppStore; s
     finally { setBusy(false); }
   };
   return <main className="onboarding">
-    <div className="onboarding-top"><Logo /><span>YOUR OWN LITTLE CORNER</span></div>
+    <div className="onboarding-top"><Logo /></div>
     <section className="onboarding-card" aria-labelledby="onboarding-title">
       {step === 0 && <>
         <AmbientMedia enabled={settings.ambientMotion} className="welcome-media" />
-        <div className="onboarding-copy"><span className="eyebrow">WELCOME TO FORMA</span><h1 id="onboarding-title">A little more room<br />to think.</h1><p>Your chats stay on this device. Bring a question, an idea, or a little everyday chaos.</p></div>
+        <div className="onboarding-copy"><span className="eyebrow">WELCOME TO FORMA</span><h1 id="onboarding-title">Set up your space.</h1><p>Keep your chats, browse your services, and choose the AI you use.</p></div>
       </>}
       {step === 1 && <div className="onboarding-copy accounts-step">
-        <span className="step-symbol"><EnvelopeSimple size={27} /></span><span className="eyebrow">MAKE YOURSELF AT HOME</span><h1 id="onboarding-title">Your world, at your pace.</h1><p>Start with what you share in chat. Account connections are on the way.</p>
-        <Accounts /><ProviderSetup store={store} settings={settings} onBusyChange={setBusy} />
+        <span className="step-symbol"><EnvelopeSimple size={27} /></span><h1 id="onboarding-title">Sign in to your services.</h1><p>Use your Forma browser. Its sessions stay separate from your normal browsing.</p>
+        <Accounts browser={browser} /><ProviderSetup store={store} settings={settings} onBusyChange={setBusy} />
       </div>}
       {step === 2 && <div className="onboarding-copy start-step">
-        <span className="step-symbol"><Sparkle size={29} /></span><span className="eyebrow">ALL SET TO EXPLORE</span><h1 id="onboarding-title">What’s on your mind?</h1><p>A fresh chat is waiting. Your work will be remembered as you go.</p>
+        <span className="step-symbol"><Sparkle size={29} /></span><h1 id="onboarding-title">Anything else to add?</h1><p>You can add more services now or come back from Settings.</p><button type="button" className="button secondary" disabled={busy || browser.busy} onClick={() => { void advance(1); }}>Add another service <ArrowRight size={16} /></button>
         <div className="readiness-card"><Check size={20} /><span>Local chats & drafts<span className="row-detail">Ready whenever you are</span></span></div>
         <div className="readiness-card"><GearSix size={20} /><span>AI connection<span className="row-detail">{settings.provider.verified ? 'Checked and ready' : 'Set up when you’re ready to send'}</span></span>
           {!settings.provider.verified && <button className="text-button" type="button" onClick={onSettings}>Settings <ArrowRight size={14} /></button>}</div>
@@ -141,9 +211,8 @@ export function Onboarding({ store, settings, onSettings }: { store: AppStore; s
       <footer className="onboarding-footer">
         <div className="step-dots" aria-label={`Step ${step + 1} of 3`}>{[0, 1, 2].map(index => <span key={index} className={index === step ? 'current' : ''} />)}</div>
         <div>{step > 0 && <button className="text-button muted" type="button" disabled={busy} onClick={() => void advance(step - 1)}>Back</button>}
-          <button className="button primary" type="button" disabled={busy} onClick={() => void advance(step + 1)}>{busy ? 'One moment…' : step === 2 ? 'Open chat' : step === 1 ? 'Continue without accounts' : 'Make yourself at home'}<ArrowRight size={17} /></button></div>
+          <button className="button primary" type="button" disabled={busy} onClick={() => void advance(step + 1)}>{busy ? 'One moment…' : step === 2 ? 'Open chat' : step === 1 ? 'Continue' : 'Get started'}<ArrowRight size={17} /></button></div>
       </footer>
     </section>
-    <p className="onboarding-bottom">No signup. No rush.</p>
   </main>;
 }
