@@ -210,7 +210,7 @@ No catch-up burst: record missed slots and advance next due; restart does not au
 
 ## Worker boundary and verification
 
-Exact model-visible allowlist: `forma_interface_list`, `forma_interface_get`, `forma_interface_propose`, `forma_schedule_create`, `forma_gmail_list_metadata`, `forma_calendar_list_events`. Every handler receives server-bound run context, never model-selected library/device/grants. No shell/web/browser/arbitrary MCP/delegation/execute_code/cronjob/grant/enable tools.
+Exact model-visible allowlist: `forma_interface_list`, `forma_interface_get`, `forma_interface_propose`, `forma_schedule_create`, `forma_gmail_list_metadata`, `forma_calendar_list_events`, `forma_list_connected_services`, `forma_request_service_connection`. The two Composio tools bridge to the native connector host and return connection statuses/prompt outcomes only — no account data, no Composio API access from the runtime, no grant required. Every handler receives server-bound run context, never model-selected library/device/grants. No shell/web/browser/arbitrary MCP/delegation/execute_code/cronjob/grant/enable tools.
 
 Pinned API compatibility detail: Hermes automatically defers custom toolsets behind generic tool_search/tool_describe/tool_call unless `get_tool_definitions(skip_tool_search_assembly=True)` is enforced by the adapter. Forma disables that assembly and asserts the exact direct schema set before any request. `_fire_stream_delta` can also deliver non-text metadata; forward only nonempty strings as assistant.delta, with authoritative tool events supplied by the owned handler RPC.
 

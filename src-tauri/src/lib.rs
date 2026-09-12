@@ -345,6 +345,9 @@ pub fn run() {
                 directory.as_ref().ok().cloned(),
                 test_directory.clone(),
             ));
+            app.manage(connectors::composio::ComposioState::new(
+                test_directory.clone(),
+            ));
             let native = directory
                 .and_then(|directory| store::Store::open(&directory))
                 .map(|store| {
@@ -411,6 +414,14 @@ pub fn run() {
             connectors::connectors_grant_revoke,
             connectors::connectors_run_cancel,
             connectors::connectors_read_capabilities,
+            connectors::composio::composio_status,
+            connectors::composio::composio_catalog,
+            connectors::composio::composio_categories,
+            connectors::composio::composio_start,
+            connectors::composio::composio_cancel,
+            connectors::composio::composio_disconnect,
+            connectors::composio::composio_key_save,
+            connectors::composio::composio_key_remove,
             runtime::runtime_status,
             runtime::runtime_retry,
             runtime::runtime_check,

@@ -3,8 +3,10 @@
 mod grants;
 mod keychain;
 mod lifecycle;
+pub mod composio;
 mod reads;
 pub use grants::{ConnectorGrant, EgressConsent, GrantRequest, ReadOperation, RuntimeReadContext};
+pub use composio::dispatch_runtime_tool;
 pub use reads::{dispatch_runtime_read, validate_runtime_delivery, ConnectorReadResult};
 mod loopback;
 mod oauth;

@@ -13,8 +13,9 @@ VERSION = "forma-runtime-v1"
 LIMITS = {"maxIterations": 8, "maxToolCalls": 12, "maxOutputTokens": 4096,
           "maxDurationSeconds": 180, "maxToolResultBytes": 262144}
 GOOGLE_TOOLS = ("forma_gmail_list_metadata", "forma_calendar_list_events")
+COMPOSIO_TOOLS = ("forma_list_connected_services", "forma_request_service_connection")
 TOOLS = ("forma_interface_list", "forma_interface_get", "forma_interface_propose",
-         "forma_schedule_create", *GOOGLE_TOOLS)
+         "forma_schedule_create", *GOOGLE_TOOLS, *COMPOSIO_TOOLS)
 TERMINAL = frozenset(("succeeded", "failed", "cancelled", "interrupted", "blocked"))
 IDENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,79}$")
 FORBIDDEN_IDS = frozenset(("__proto__", "prototype", "constructor"))
@@ -420,6 +421,38 @@ def google_args(value):
     require(timedelta(0) < end - start <= timedelta(days=7), "Read window exceeds seven days")
     integer(value["maxItems"], 1, 100)
     return value
+
+
+SERVICE_SLUG = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
+SERVICE_STATUS = frozenset(("connected", "connecting", "needs_attention"))
+CONNECTION_STATUS = frozenset(("pending_user_action", "initiated", "failed", "already_connected"))
+
+
+def composio_args(value):
+    obj(value, ("service",))
+    text(value["service"], 80, 1)
+    require(SERVICE_SLUG.fullmatch(value["service"]), "Invalid service slug")
+    return value
+
+
+def composio_result(data, request):
+    """Native Composio tool results: statuses only, never account data or secrets."""
+    obj(data, ("kind",), ("configured", "status", "detail", "service", "items"))
+    name = request["toolName"]
+    if name == COMPOSIO_TOOLS[0]:
+        require(data["kind"] == "connectedServices", "Wrong result kind")
+        require(type(data.get("configured", True)) is bool, "Invalid configured flag")
+        for item in array(data["items"], 50):
+            obj(item, ("slug", "status"))
+            require(SERVICE_SLUG.fullmatch(text(item["slug"], 80, 1)), "Invalid service slug")
+            require(text(item["status"], 40, 1) in SERVICE_STATUS, "Invalid service status")
+    else:
+        require(data["kind"] == "serviceConnectionRequest", "Wrong result kind")
+        require(data.get("service") == request["args"]["service"], "Wrong service")
+        require(data["status"] in CONNECTION_STATUS, "Invalid connection status")
+        if "detail" in data: text(data["detail"], 200)
+    require(len(canonical(data).encode()) <= 65536, "Tool result too large")
+    return data
 
 
 def calendar_date(value):

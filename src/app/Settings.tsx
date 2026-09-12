@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
-import { ArrowRight, ArrowSquareOut, Check, CheckCircle, EnvelopeSimple, GearSix, GoogleLogo, LockSimple, Sparkle, X } from '@phosphor-icons/react';
+import { ArrowRight, ArrowSquareOut, Check, CheckCircle, EnvelopeSimple, GearSix, GoogleLogo, LockSimple, Plugs, Sparkle, X } from '@phosphor-icons/react';
 import { AccountGrantStatus, RuntimeSettings } from './RuntimeSettings';
 import type { AppSettings } from './contracts';
 import type { AppStore } from './store';
@@ -9,6 +9,9 @@ import { BrowserConnections } from './BrowserView';
 import type { OwnedBrowser } from './owned-browser';
 import type { ConnectorStatus } from './browser-contracts';
 import { GOOGLE_DEFAULT_SCOPES, useConnectors, type ConnectorsController } from './connectors';
+import { ServiceCatalog, catalogSurface } from './services';
+import type { ServicesController } from './services-controller';
+import { validComposioKey } from './services-contracts';
 
 function GoogleAccountRow({ item, controller }: { item: ConnectorStatus; controller: ConnectorsController }) {
   const [open, setOpen] = useState(false);
@@ -37,7 +40,7 @@ function GoogleAccountRow({ item, controller }: { item: ConnectorStatus; control
   </div>;
 }
 
-export function Accounts({ browser }: { browser: OwnedBrowser }) {
+export function Accounts({ browser, services, onManageServices }: { browser: OwnedBrowser; services: ServicesController; onManageServices: () => void }) {
   const connectors = useConnectors(browser.native);
   const googleAccounts = connectors.items.filter(item => item.provider === 'google');
   const capabilities = connectors.capabilities;
@@ -59,6 +62,13 @@ export function Accounts({ browser }: { browser: OwnedBrowser }) {
         : 'Request Gmail metadata & Calendar read-only permissions';
   const startSignIn = () => connectors.startGoogle(capabilities.defaultScopes.length ? capabilities.defaultScopes : GOOGLE_DEFAULT_SCOPES);
   return <div className="browser-connections">
+    <div className="account-row connector-row services-entry-row">
+      <span className="account-icon"><Plugs size={20} /></span>
+      <span>All services<span className="row-detail">Composio connects Forma to each service you choose</span></span>
+      <button type="button" className="button secondary" onClick={onManageServices}>Manage services <ArrowRight size={14} /></button>
+    </div>
+    <ComposioKeyField services={services} />
+    <p className="field-note">Every service — including Google — connects through Composio from the Services page. The direct Google sign-in below stays as a secondary option while that settles.</p>
     <div className="account-row connector-row">
       <span className="account-icon"><GoogleLogo size={20} /></span>
       <span>Google<span className="row-detail" role="status" aria-live="polite">{detail}</span></span>
@@ -78,6 +88,43 @@ export function Accounts({ browser }: { browser: OwnedBrowser }) {
     {connectors.error && <InlineError>{connectors.error}</InlineError>}
     <BrowserConnections browser={browser} />
   </div>;
+}
+
+function ComposioKeyField({ services }: { services: ServicesController }) {
+  const [apiKey, setApiKey] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [saved, setSaved] = useState(false);
+  const stored = services.snapshot?.keyConfigured ?? false;
+  const trimmed = apiKey.trim();
+  const submit = async () => {
+    if (busy || !validComposioKey(trimmed)) return;
+    setBusy(true); setError(null); setSaved(false);
+    try { await services.saveKey(trimmed); setApiKey(''); setSaved(true); }
+    catch (failure) { setError(friendlyError(failure)); }
+    finally { setBusy(false); }
+  };
+  const remove = async () => {
+    if (busy) return;
+    setBusy(true); setError(null); setSaved(false);
+    try { await services.removeKey(); }
+    catch (failure) { setError(friendlyError(failure)); }
+    finally { setBusy(false); }
+  };
+  return <form className="composio-key-field" onSubmit={event => { event.preventDefault(); void submit(); }}>
+    <label>Composio API key <span className="optional">{stored ? 'stored securely' : 'for connecting services'}</span>
+      <input type="password" value={apiKey} maxLength={4096} autoComplete="off" autoCapitalize="off" spellCheck={false}
+        data-1p-ignore="true" data-lpignore="true" disabled={busy}
+        placeholder={stored ? 'Leave blank to keep your stored key' : 'Paste your Composio key (starts with ak_)'}
+        onChange={event => { setApiKey(event.target.value); setSaved(false); }} /></label>
+    <div className="provider-actions">
+      <button className="button secondary" type="submit" disabled={busy || !validComposioKey(trimmed)}>{busy ? 'Saving…' : 'Save key'}</button>
+      {stored && <button type="button" className="text-button muted" disabled={busy} onClick={() => void remove()}>Remove stored key</button>}
+    </div>
+    {saved && <p className="connection-success" role="status"><CheckCircle size={13} />Composio key stored in your OS keychain.</p>}
+    {error && <InlineError>{error}</InlineError>}
+    <p className="field-note">The key is stored only in your OS keychain — never in chats, logs, or files — and can be removed anytime. Without it, service listing and connecting stay unavailable.</p>
+  </form>;
 }
 
 function ProviderSetup({ store, settings, onBusyChange }: { store: AppStore; settings: AppSettings; onBusyChange?: (busy: boolean) => void }) {
@@ -144,7 +191,7 @@ function ProviderSetup({ store, settings, onBusyChange }: { store: AppStore; set
   );
 }
 
-export function Settings({ store, settings, browser, onClose }: { store: AppStore; settings: AppSettings; browser: OwnedBrowser; onClose: () => void }) {
+export function Settings({ store, settings, browser, services, onServicesView, onClose }: { store: AppStore; settings: AppSettings; browser: OwnedBrowser; services: ServicesController; onServicesView: () => void; onClose: () => void }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [name, setName] = useState(settings.displayName);
@@ -165,7 +212,8 @@ export function Settings({ store, settings, browser, onClose }: { store: AppStor
       <label className="toggle-row"><span>Ambient motion<span className="row-detail">A little movement in your empty space</span></span>
         <input type="checkbox" role="switch" checked={settings.ambientMotion} disabled={busy} onChange={event => void save({ ambientMotion: event.target.checked })} /></label>
     </section>
-    <section className="settings-section"><h3>Accounts</h3><Accounts browser={browser} /></section>
+    <section className="settings-section"><h3>Accounts</h3>
+      <Accounts browser={browser} services={services} onManageServices={() => { onClose(); onServicesView(); }} /></section>
     <section className="settings-section">
       <div className="section-heading"><h3>Model & provider</h3><span className="availability">{settings.provider.verified ? 'Checked' : settings.provider.baseUrl ? 'Needs a check' : 'Not set up'}</span></div>
       {!store.bridge.native && <p className="browser-note"><LockSimple size={18} /><span>This browser preview saves chats and drafts locally. AI connections and secure keys are available in the desktop app.</span></p>}
@@ -179,14 +227,14 @@ export function Settings({ store, settings, browser, onClose }: { store: AppStor
   </Modal>;
 }
 
-export function Onboarding({ store, settings, browser, onSettings }: { store: AppStore; settings: AppSettings; browser: OwnedBrowser; onSettings: () => void }) {
+export function Onboarding({ store, settings, browser, services, onSettings }: { store: AppStore; settings: AppSettings; browser: OwnedBrowser; services: ServicesController; onSettings: () => void }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const step = Math.min(2, Math.max(0, settings.onboardingStep));
+  const step = Math.min(3, Math.max(0, settings.onboardingStep));
   const advance = async (next: number) => {
     if (busy) return;
     setBusy(true); setError(null);
-    try { await store.saveSettings(next > 2 ? { onboardingComplete: true, onboardingStep: 2 } : { onboardingStep: next }); }
+    try { await store.saveSettings(next > 3 ? { onboardingComplete: true, onboardingStep: 3 } : { onboardingStep: next }); }
     catch (failure) { setError(friendlyError(failure)); }
     finally { setBusy(false); }
   };
@@ -199,19 +247,25 @@ export function Onboarding({ store, settings, browser, onSettings }: { store: Ap
       </>}
       {step === 1 && <div className="onboarding-copy accounts-step">
         <span className="step-symbol"><EnvelopeSimple size={27} /></span><h1 id="onboarding-title">Sign in to your services.</h1><p>Connect Google through your default browser, or browse services separately in Forma.</p>
-        <Accounts browser={browser} /><ProviderSetup store={store} settings={settings} onBusyChange={setBusy} />
+        <Accounts browser={browser} services={services} onManageServices={() => void advance(2)} /><ProviderSetup store={store} settings={settings} onBusyChange={setBusy} />
       </div>}
-      {step === 2 && <div className="onboarding-copy start-step">
-        <span className="step-symbol"><Sparkle size={29} /></span><h1 id="onboarding-title">Anything else to add?</h1><p>You can add more services now or come back from Settings.</p><button type="button" className="button secondary" disabled={busy || browser.busy} onClick={() => { void advance(1); }}>Add another service <ArrowRight size={16} /></button>
+      {step === 2 && <div className="onboarding-copy accounts-step services-step">
+        <span className="step-symbol"><Plugs size={27} /></span><h1 id="onboarding-title">Connect your services.</h1><p>Optional, and you can change this later in Settings. Connecting opens your default browser — Forma never reads that browser’s cookies or profiles.</p>
+        <ServiceCatalog surface={catalogSurface(services)} />
+        <p className="field-note">Services are provided by Composio. If the list does not load, add your Composio API key from Settings → Accounts.</p>
+      </div>}
+      {step === 3 && <div className="onboarding-copy start-step">
+        <span className="step-symbol"><Sparkle size={29} /></span><h1 id="onboarding-title">Anything else to add?</h1><p>You can add more services now or come back from Settings.</p><button type="button" className="button secondary" disabled={busy || browser.busy} onClick={() => { void advance(2); }}>Add another service <ArrowRight size={16} /></button>
         <div className="readiness-card"><Check size={20} /><span>Local chats & drafts<span className="row-detail">Ready whenever you are</span></span></div>
         <div className="readiness-card"><GearSix size={20} /><span>Model provider<span className="row-detail">{settings.provider.verified ? 'Provider checked · Hermes status is in Settings' : 'Set up when you’re ready to send'}</span></span>
           {!settings.provider.verified && <button className="text-button" type="button" onClick={onSettings}>Settings <ArrowRight size={14} /></button>}</div>
       </div>}
       {error && <InlineError>{error}</InlineError>}
       <footer className="onboarding-footer">
-        <div className="step-dots" aria-label={`Step ${step + 1} of 3`}>{[0, 1, 2].map(index => <span key={index} className={index === step ? 'current' : ''} />)}</div>
-        <div>{step > 0 && <button className="text-button muted" type="button" disabled={busy} onClick={() => void advance(step - 1)}>Back</button>}
-          <button className="button primary" type="button" disabled={busy} onClick={() => void advance(step + 1)}>{busy ? 'One moment…' : step === 2 ? 'Open chat' : step === 1 ? 'Continue' : 'Get started'}<ArrowRight size={17} /></button></div>
+        <div className="step-dots" aria-label={`Step ${step + 1} of 4`}>{[0, 1, 2, 3].map(index => <span key={index} className={index === step ? 'current' : ''} />)}</div>
+        <div>{step === 2 && <button className="text-button muted" type="button" disabled={busy} onClick={() => void advance(step + 1)}>Connect later</button>}
+          {step > 0 && <button className="text-button muted" type="button" disabled={busy} onClick={() => void advance(step - 1)}>Back</button>}
+          <button className="button primary" type="button" disabled={busy} onClick={() => void advance(step + 1)}>{busy ? 'One moment…' : step === 3 ? 'Open chat' : step === 0 ? 'Get started' : 'Continue'}<ArrowRight size={17} /></button></div>
       </footer>
     </section>
   </main>;

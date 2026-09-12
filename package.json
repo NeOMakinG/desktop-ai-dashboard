@@ -15,7 +15,7 @@
     "desktop": "tauri dev",
     "desktop:build": "tauri build --debug --bundles app --no-sign",
     "typecheck": "tsc --noEmit",
-    "test": "node --experimental-transform-types --input-type=module -e \"for (const [file, run] of [['store', 'runStoreRegressionChecks'], ['browser', 'runBrowserRegressionChecks'], ['message', 'runMessageRegressionChecks'], ['interface', 'runInterfaceRegressionChecks'], ['runtime', 'runRuntimeRegressionChecks']]) { const m = await import('./src/app/' + file + '.regression.ts'); console.log(file, await m[run]()); }\""
+    "test": "node --experimental-transform-types --input-type=module -e \"for (const [file, run] of [['store', 'runStoreRegressionChecks'], ['browser', 'runBrowserRegressionChecks'], ['services', 'runServicesRegressionChecks'], ['message', 'runMessageRegressionChecks'], ['interface', 'runInterfaceRegressionChecks'], ['runtime', 'runRuntimeRegressionChecks']]) { const m = await import('./src/app/' + file + '.regression.ts'); console.log(file, await m[run]()); }\""
   },
   "dependencies": {
     "@phosphor-icons/react": "2.1.10",

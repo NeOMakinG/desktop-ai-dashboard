@@ -579,20 +579,30 @@ async fn dispatch_tool(
             .capabilities
             .ok_or_else(transport::not_ready)?
     };
+    // Composio connection tools are grant-free by design: they expose only
+    // host-validated connect/status prompts and never read account data, so
+    // neither grant containment nor connection identity applies to them.
+    let composio_tool = matches!(
+        tool.tool_name.as_str(),
+        "forma_list_connected_services" | "forma_request_service_connection"
+    );
     if tool.run_id != request.progress.request_id
         || tool.workspace_id != request.input.workspace_id
         || tool.device_id != caps.device_id
-        || !request.input.grant_refs.contains(&tool.grant_ref)
+        || (!composio_tool && !request.input.grant_refs.contains(&tool.grant_ref))
     {
         return Err(transport::protocol());
     }
     let operation = match tool.tool_name.as_str() {
-        "forma_gmail_list_metadata" => ReadOperation::GmailListMetadata,
-        "forma_calendar_list_events" => ReadOperation::CalendarListEvents,
+        "forma_gmail_list_metadata" => Some(ReadOperation::GmailListMetadata),
+        "forma_calendar_list_events" => Some(ReadOperation::CalendarListEvents),
+        _ if composio_tool => None,
         _ => return Err(transport::protocol()),
     };
     validation::id(&tool.id)?;
-    validation::id(&tool.connection_id)?;
+    if !composio_tool {
+        validation::id(&tool.connection_id)?;
+    }
     let path = format!("/v1/runs/{}", request.progress.request_id);
     let claim: ToolClaim = session
         .post(
@@ -621,20 +631,37 @@ async fn dispatch_tool(
     {
         return Err(transport::protocol());
     }
-    let context = RuntimeReadContext {
-        workspace_id: request.input.workspace_id.clone(),
-        run_id: request.progress.request_id.clone(),
-        device_id: caps.device_id,
-        connection_id: tool.connection_id,
-        grant_id: tool.grant_ref.id,
-        generation: tool.grant_ref.generation,
-        runtime_origin: session.endpoint.clone(),
-        model_origin: caps.model_origin,
-        operation,
-        args: tool.args,
-        expires_at: tool.expires_at,
+    let mut delivery_context: Option<RuntimeReadContext> = None;
+    let result: AppResult<Value> = match operation {
+        None => {
+            crate::connectors::dispatch_runtime_tool(
+                app,
+                &tool.workspace_id,
+                &tool.run_id,
+                &tool.tool_name,
+                &tool.args,
+            )
+            .await
+        }
+        Some(operation) => {
+            let context = RuntimeReadContext {
+                workspace_id: request.input.workspace_id.clone(),
+                run_id: request.progress.request_id.clone(),
+                device_id: caps.device_id,
+                connection_id: tool.connection_id,
+                grant_id: tool.grant_ref.id,
+                generation: tool.grant_ref.generation,
+                runtime_origin: session.endpoint.clone(),
+                model_origin: caps.model_origin,
+                operation,
+                args: tool.args,
+                expires_at: tool.expires_at,
+            };
+            let read = crate::connectors::dispatch_runtime_read(app, context.clone()).await;
+            delivery_context = Some(context);
+            read.and_then(|data| serde_json::to_value(&data).map_err(|_| transport::protocol()))
+        }
     };
-    let result = crate::connectors::dispatch_runtime_read(app, context.clone()).await;
     {
         let core = state.lock()?;
         core.store.runtime_current(request)?;
@@ -644,7 +671,9 @@ async fn dispatch_tool(
     }
     let body = match result {
         Ok(data) => {
-            crate::connectors::validate_runtime_delivery(app, &context)?;
+            if let Some(context) = &delivery_context {
+                crate::connectors::validate_runtime_delivery(app, context)?;
+            }
             json!({"requestId":tool.id,"claimToken":claim.claim_token,"outcome":"succeeded","data":data})
         }
         Err(_) => {

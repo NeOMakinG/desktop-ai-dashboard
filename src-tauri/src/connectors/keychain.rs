@@ -66,11 +66,117 @@ impl ConnectorSecrets for OsSecrets {
     }
 }
 
+/// Composio project API key: same OS-keychain custody as provider keys. The
+/// value is never persisted, logged, or exposed past the native host.
+pub trait ComposioKeys: Send + Sync {
+    fn read(&self) -> AppResult<Zeroizing<String>>;
+    fn has(&self) -> bool;
+    fn write(&self, key: &str) -> AppResult<()>;
+    fn remove(&self) -> AppResult<()>;
+}
+
+pub struct ComposioKeyStore {
+    namespace: Option<String>,
+}
+
+impl ComposioKeyStore {
+    const SERVICE: &'static str = "dev.forma.composio.v1";
+    pub fn new(test_directory: Option<&std::path::Path>) -> Self {
+        let namespace = test_directory.map(|path| {
+            format!(
+                "dev.forma.composio.qa.{:x}",
+                Sha256::digest(path.as_os_str().to_string_lossy().as_bytes())
+            )
+        });
+        Self { namespace }
+    }
+    fn service(&self) -> &str {
+        self.namespace.as_deref().unwrap_or(Self::SERVICE)
+    }
+    fn entry(&self) -> AppResult<keyring::Entry> {
+        keyring::Entry::new(self.service(), "api-key").map_err(|_| composio_key_error())
+    }
+}
+
+fn composio_key_error() -> AppError {
+    AppError::new(
+        "composio_key_store",
+        "The OS credential store is unavailable or access was denied. No key is saved in plaintext.",
+    )
+}
+
+impl ComposioKeys for ComposioKeyStore {
+    fn read(&self) -> AppResult<Zeroizing<String>> {
+        let value = self
+            .entry()?
+            .get_password()
+            .map_err(|_| composio_key_error())?;
+        if value.is_empty() {
+            return Err(AppError::new(
+                "composio_not_configured",
+                "No Composio API key is saved yet. Paste it in Settings, then try again.",
+            ));
+        }
+        Ok(Zeroizing::new(value))
+    }
+    fn has(&self) -> bool {
+        self.entry()
+            .and_then(|entry| entry.get_password().map(|value| !value.is_empty()))
+            .unwrap_or(false)
+    }
+    fn write(&self, key: &str) -> AppResult<()> {
+        self.entry()?
+            .set_password(key)
+            .map_err(|_| composio_key_error())
+    }
+    fn remove(&self) -> AppResult<()> {
+        match self.entry()?.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(_) => Err(composio_key_error()),
+        }
+    }
+}
+
 #[cfg(test)]
 pub mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::sync::Mutex;
+
+    #[derive(Default)]
+    pub struct MemoryKeys(pub Mutex<Option<String>>);
+
+    impl ComposioKeys for MemoryKeys {
+        fn read(&self) -> AppResult<Zeroizing<String>> {
+            self.0
+                .lock()
+                .unwrap()
+                .clone()
+                .filter(|value| !value.is_empty())
+                .map(Zeroizing::new)
+                .ok_or_else(|| {
+                    AppError::new(
+                        "composio_not_configured",
+                        "No Composio API key is saved yet.",
+                    )
+                })
+        }
+        fn has(&self) -> bool {
+            self.0
+                .lock()
+                .unwrap()
+                .as_deref()
+                .is_some_and(|value| !value.is_empty())
+        }
+        fn write(&self, key: &str) -> AppResult<()> {
+            *self.0.lock().unwrap() = Some(key.to_owned());
+            Ok(())
+        }
+        fn remove(&self) -> AppResult<()> {
+            *self.0.lock().unwrap() = None;
+            Ok(())
+        }
+    }
 
     #[derive(Default)]
     pub struct MemorySecrets(pub Mutex<HashMap<String, String>>);
@@ -131,5 +237,30 @@ pub mod tests {
         assert!(secrets.read("id-1").is_err());
         // Removing an already-absent entry is a no-op.
         secrets.remove("id-1").unwrap();
+    }
+
+    #[test]
+    fn composio_key_namespaces_never_match_production_or_each_other() {
+        let production = ComposioKeyStore::new(None);
+        let qa_a = ComposioKeyStore::new(Some(Path::new("/tmp/forma-qa-a")));
+        let qa_b = ComposioKeyStore::new(Some(Path::new("/tmp/forma-qa-b")));
+        assert_eq!(production.service(), "dev.forma.composio.v1");
+        assert_ne!(production.service(), qa_a.service());
+        assert_ne!(qa_a.service(), qa_b.service());
+        assert!(qa_a.service().starts_with("dev.forma.composio.qa."));
+    }
+
+    #[test]
+    fn memory_keys_round_trip_and_missing() {
+        let keys = MemoryKeys::default();
+        assert!(!keys.has());
+        assert_eq!(keys.read().unwrap_err().code, "composio_not_configured");
+        keys.write("ak_synthetic").unwrap();
+        assert!(keys.has());
+        assert_eq!(keys.read().unwrap().as_str(), "ak_synthetic");
+        keys.remove().unwrap();
+        assert!(!keys.has());
+        // Removing an already-absent entry is a no-op.
+        keys.remove().unwrap();
     }
 }

@@ -53,7 +53,9 @@ def schema(name, properties, required=()):
         "forma_interface_propose": "Propose a validated novel trusted interface. Operator publishes. No code, live badges or authority.",
         "forma_schedule_create": "Create a PAUSED UTC refresh schedule proposal only. Cannot activate schedules.",
         "forma_gmail_list_metadata": "Request explicitly granted bounded synthetic Gmail metadata from native credential host. No body/query/write.",
-        "forma_calendar_list_events": "Request explicitly granted bounded synthetic Calendar events from native credential host. No write."
+        "forma_calendar_list_events": "Request explicitly granted bounded synthetic Calendar events from native credential host. No write.",
+        "forma_list_connected_services": "List which services are connected through the native connector host. Read-only statuses, no account data.",
+        "forma_request_service_connection": "Ask the user to connect a missing service. Shows a native prompt and reports honest status; never connects automatically."
     }[name], "parameters": {"type": "object", "properties": properties, "required": list(required), "additionalProperties": False}}
 
 
@@ -90,7 +92,7 @@ def main():
     from openai import OpenAI
     from run_agent import AIAgent
     from tools.registry import registry
-    from forma_runtime.contracts import TOOLS, GOOGLE_TOOLS
+    from forma_runtime.contracts import TOOLS, GOOGLE_TOOLS, COMPOSIO_TOOLS
 
     string = {"type": "string"}
     number = {"type": "integer"}
@@ -106,6 +108,8 @@ def main():
     }
     for name in GOOGLE_TOOLS:
         definitions[name] = schema(name, {"startAt": string, "endAt": string, "maxItems": number}, ("startAt", "endAt", "maxItems"))
+    definitions[COMPOSIO_TOOLS[0]] = schema(COMPOSIO_TOOLS[0], {})
+    definitions[COMPOSIO_TOOLS[1]] = schema(COMPOSIO_TOOLS[1], {"service": string}, ("service",))
     allowed = frozenset(job["allowedTools"])
     assert allowed <= frozenset(TOOLS)
     for name in allowed:

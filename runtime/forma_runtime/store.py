@@ -443,7 +443,9 @@ class Store:
         require(request["state"] == "claimed" and instant(request["_claimUntil"]) > datetime.now(UTC), "Claim expired", "stale_claim", 409)
         outcome = body["outcome"]; require(outcome in ("succeeded", "failed", "denied", "unavailable"), "Invalid outcome")
         if outcome == "succeeded":
-            require("data" in body and "error" not in body, "Success needs data only"); google_result(body["data"], request)
+            require("data" in body and "error" not in body, "Success needs data only")
+            if request["toolName"] in COMPOSIO_TOOLS: composio_result(body["data"], request)
+            else: google_result(body["data"], request)
         else:
             require("error" in body and "data" not in body, "Failure needs error only")
             obj(body["error"], ("code", "message")); text(body["error"]["code"], 100, 1); text(body["error"]["message"], 2000)
@@ -477,6 +479,20 @@ class Store:
             if name == "forma_schedule_create":
                 obj(args, ("interfaceId", "expectedInterfaceRevision", "prompt", "cron", "timezone", "endAt", "maxRuns", "budgets"))
                 return self.create_schedule(dict(args, workspaceId=run["workspaceId"], modelId=run["modelId"], grantRefs=run["_input"]["grantRefs"]), run)
+            if name in COMPOSIO_TOOLS:
+                # Connection-status tools bridge to the native Composio host.
+                # They carry no account read authority, so no grant applies;
+                # the connection/grant ids are opaque placeholders the host
+                # re-validates by run, workspace and device identity.
+                if name == COMPOSIO_TOOLS[0]: obj(args)
+                else: composio_args(args)
+                request = {"id": new_id(), "runId": rid, "workspaceId": run["workspaceId"], "deviceId": self.device_id,
+                           "connectionId": new_id(), "grantRef": {"id": new_id(), "generation": 1},
+                           "toolName": name, "args": args, "expiresAt": stamp(instant(run["_deadline"])), "state": "pending"}
+                self.put("tool", request["id"], request)
+                self.event(run, "tool.requested", {"requestId": request["id"], "toolName": name, "deviceId": self.device_id})
+                self.state(run, "waiting_for_device", "native_tool_required")
+                return {"_waitRequest": request["id"]}
             google_args(args)
             grants = self.check_grants(run["workspaceId"], run["modelId"], run["_input"]["grantRefs"])
             choices = [g for g in grants if name in g["operations"]]

@@ -24,6 +24,18 @@ enum ParsedCallback {
     Denied,
 }
 
+/// A generic first GET on the callback path. Query parameters stay untrusted
+/// and unread; callers that need authority re-verify out of band.
+pub struct Arrival {
+    #[allow(dead_code)]
+    pub target: String,
+}
+
+enum ArrivalDecision {
+    Ignore,
+    Arrive(String),
+}
+
 impl Loopback {
     pub fn bind() -> AppResult<Self> {
         let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
@@ -67,6 +79,40 @@ impl Loopback {
                             ))
                         }
                         ParsedCallback::Ignore => {}
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(POLL_INTERVAL)
+                }
+                Err(_) => return Err(bind_error()),
+            }
+        }
+    }
+
+    /// Composio link flow: any well-formed GET on the exact path completes the
+    /// wait. The provider's callback parameters are undocumented and therefore
+    /// carry no authority; connection state is re-read from the API afterwards.
+    pub fn wait_for_arrival(
+        &self,
+        path: &str,
+        deadline: Instant,
+        cancel: &CancellationToken,
+    ) -> AppResult<Arrival> {
+        loop {
+            if cancel.is_cancelled() {
+                return Err(super::lifecycle::stale_error());
+            }
+            if Instant::now() >= deadline {
+                return Err(super::lifecycle::timeout_error());
+            }
+            match self.listener.accept() {
+                Ok((stream, peer)) => {
+                    if peer.ip() != std::net::IpAddr::V4(Ipv4Addr::LOCALHOST) {
+                        continue;
+                    }
+                    match handle_arrival(stream, self.port, path, deadline, cancel) {
+                        ArrivalDecision::Arrive(target) => return Ok(Arrival { target }),
+                        ArrivalDecision::Ignore => {}
                     }
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -244,6 +290,102 @@ fn handle_request(
     ParsedCallback::Ignore
 }
 
+fn parse_arrival(request: &[u8], port: u16, path: &str) -> ArrivalDecision {
+    if request.len() > MAX_REQUEST_BYTES {
+        return ArrivalDecision::Ignore;
+    }
+    let Ok(text) = std::str::from_utf8(request) else {
+        return ArrivalDecision::Ignore;
+    };
+    let Some((headers, _)) = text.split_once("\r\n\r\n") else {
+        return ArrivalDecision::Ignore;
+    };
+    let mut lines = headers.split("\r\n");
+    let parts: Vec<_> = lines.next().unwrap_or("").split(' ').collect();
+    if parts.len() != 3 || parts[0] != "GET" || !matches!(parts[2], "HTTP/1.1" | "HTTP/1.0") {
+        return ArrivalDecision::Ignore;
+    }
+    let target = parts[1];
+    // Only an origin-form target on the exact path; query is present but ignored.
+    if !target.starts_with(path) || target.contains('#') || target.contains('\\') {
+        return ArrivalDecision::Ignore;
+    }
+    let tail = &target[path.len()..];
+    if !tail.is_empty() && !tail.starts_with('?') {
+        return ArrivalDecision::Ignore;
+    }
+    let expected_host = format!("127.0.0.1:{port}");
+    let mut hosts = 0;
+    for line in lines {
+        let Some((key, value)) = line.split_once(':') else {
+            return ArrivalDecision::Ignore;
+        };
+        if key.eq_ignore_ascii_case("host") {
+            hosts += 1;
+            if value.trim() != expected_host {
+                return ArrivalDecision::Ignore;
+            }
+        }
+    }
+    if hosts != 1 {
+        return ArrivalDecision::Ignore;
+    }
+    ArrivalDecision::Arrive(target.to_owned())
+}
+
+fn handle_arrival(
+    mut stream: TcpStream,
+    port: u16,
+    path: &str,
+    deadline: Instant,
+    cancel: &CancellationToken,
+) -> ArrivalDecision {
+    if stream.set_nonblocking(false).is_err()
+        || stream.set_read_timeout(Some(IO_SLICE)).is_err()
+        || stream.set_write_timeout(Some(IO_SLICE)).is_err()
+    {
+        return ArrivalDecision::Ignore;
+    }
+    let read_deadline = deadline.min(Instant::now() + Duration::from_secs(1));
+    let mut buffer = [0u8; 1024];
+    let mut request = Zeroizing::new(Vec::with_capacity(1024));
+    while Instant::now() < read_deadline && !cancel.is_cancelled() {
+        match stream.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(n) => {
+                request.extend_from_slice(&buffer[..n]);
+                if request.len() > MAX_REQUEST_BYTES {
+                    return ArrivalDecision::Ignore;
+                }
+                if request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    if Instant::now() >= deadline || cancel.is_cancelled() {
+                        return ArrivalDecision::Ignore;
+                    }
+                    let result = parse_arrival(&request, port, path);
+                    let (status, body) = match &result {
+                        ArrivalDecision::Ignore => ("400 Bad Request", "Callback not accepted."),
+                        ArrivalDecision::Arrive(_) => {
+                            ("200 OK", "Connection check received. Return to Forma.")
+                        }
+                    };
+                    let _ = write_response(&mut stream, status, body);
+                    return result;
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                continue
+            }
+            Err(_) => break,
+        }
+    }
+    ArrivalDecision::Ignore
+}
+
 fn write_response(stream: &mut TcpStream, status: &str, body: &str) -> std::io::Result<()> {
     write!(stream, "HTTP/1.1 {status}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\nReferrer-Policy: no-referrer\r\nContent-Security-Policy: default-src 'none'; frame-ancestors 'none'\r\nX-Content-Type-Options: nosniff\r\n\r\n{body}", body.len())
 }
@@ -382,6 +524,74 @@ mod tests {
                 .wait_for_callback(
                     "state",
                     PATH,
+                    Instant::now() + Duration::from_secs(1),
+                    &cancel
+                )
+                .err()
+                .unwrap()
+                .code,
+            "connector_stale"
+        );
+    }
+    #[test]
+    fn generic_arrival_accepts_any_query_but_strict_path_method_and_host() {
+        let good =
+            "GET /composio/callback?anything=1&other=2 HTTP/1.1\r\nHost: 127.0.0.1:12345\r\n\r\n";
+        assert!(matches!(
+            parse_arrival(good.as_bytes(), 12345, "/composio/callback"),
+            ArrivalDecision::Arrive(target) if target.contains("anything=1")
+        ));
+        assert!(matches!(
+            parse_arrival(
+                "GET /composio/callback HTTP/1.1\r\nHost: 127.0.0.1:12345\r\n\r\n".as_bytes(),
+                12345,
+                "/composio/callback"
+            ),
+            ArrivalDecision::Arrive(_)
+        ));
+        for bad in [
+            good.replace("GET ", "POST "),
+            good.replace("Host:", "X-Host:"),
+            good.replace(":12345", ":54321"),
+            good.replace("/composio/callback?", "/composio/callback/x?"),
+            good.replace(
+                "/composio/callback",
+                "http://127.0.0.1:12345/composio/callback",
+            ),
+            good.replace("?anything=1", "#fragment"),
+            good.replace("?anything=1", "\\anything=1"),
+            good.replace("\r\n\r\n", "\r\nHost: 127.0.0.1:12345\r\n\r\n"),
+        ] {
+            assert!(
+                matches!(
+                    parse_arrival(bad.as_bytes(), 12345, "/composio/callback"),
+                    ArrivalDecision::Ignore
+                ),
+                "request {bad}"
+            );
+        }
+        assert!(matches!(
+            parse_arrival(&[0xff], 12345, "/composio/callback"),
+            ArrivalDecision::Ignore
+        ));
+    }
+    #[test]
+    fn arrival_wait_is_cancel_and_deadline_bounded_without_network() {
+        let listener = Loopback::bind().unwrap();
+        let cancel = CancellationToken::new();
+        assert_eq!(
+            listener
+                .wait_for_arrival("/composio/callback", Instant::now(), &cancel)
+                .err()
+                .unwrap()
+                .code,
+            "connector_timeout"
+        );
+        cancel.cancel();
+        assert_eq!(
+            listener
+                .wait_for_arrival(
+                    "/composio/callback",
                     Instant::now() + Duration::from_secs(1),
                     &cancel
                 )
