@@ -437,9 +437,11 @@ def composio_args(value):
 
 def composio_result(data, request):
     """Native Composio tool results: statuses only, never account data or secrets."""
-    obj(data, ("kind",), ("configured", "status", "detail", "service", "items"))
     name = request["toolName"]
     if name == COMPOSIO_TOOLS[0]:
+        # Everything indexed below is required here, like google_result: a
+        # missing field is an invalid_request Fault, never a raw KeyError.
+        obj(data, ("kind", "items"), ("configured",))
         require(data["kind"] == "connectedServices", "Wrong result kind")
         require(type(data.get("configured", True)) is bool, "Invalid configured flag")
         for item in array(data["items"], 50):
@@ -447,8 +449,9 @@ def composio_result(data, request):
             require(SERVICE_SLUG.fullmatch(text(item["slug"], 80, 1)), "Invalid service slug")
             require(text(item["status"], 40, 1) in SERVICE_STATUS, "Invalid service status")
     else:
+        obj(data, ("kind", "service", "status"), ("detail",))
         require(data["kind"] == "serviceConnectionRequest", "Wrong result kind")
-        require(data.get("service") == request["args"]["service"], "Wrong service")
+        require(data["service"] == request["args"]["service"], "Wrong service")
         require(data["status"] in CONNECTION_STATUS, "Invalid connection status")
         if "detail" in data: text(data["detail"], 200)
     require(len(canonical(data).encode()) <= 65536, "Tool result too large")

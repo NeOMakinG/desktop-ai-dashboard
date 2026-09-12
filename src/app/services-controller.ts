@@ -40,7 +40,18 @@ export function useServices(native: boolean) {
     if (!native) return;
     try {
       const next = await invoke<ServicesSnapshot>('composio_status');
-      if (alive.current) { setSnapshot(next); setStatusError(null); }
+      if (!alive.current) return;
+      setStatusError(null);
+      // While a connect attempt is live the host skips its Composio list call
+      // (F9); keep the last known connected rows visible until the attempt's
+      // own transition event triggers a reconciling snapshot.
+      setSnapshot(current => {
+        const live = isAttemptLive(next.attempt);
+        if (live && next.items.length === 0 && current?.items.length) {
+          return { ...next, items: current.items };
+        }
+        return next;
+      });
     } catch (failure) {
       if (alive.current) setStatusError(message(failure));
     }
@@ -75,9 +86,8 @@ export function useServices(native: boolean) {
         .catch(() => { /* Categories are optional; the catalog still loads. */ });
       void listen('composio:changed', () => { if (!disposed) void refreshStatus(); })
         .then(unlisten => { if (disposed) unlisten(); else release = unlisten; })
-        .catch(() => { /* Periodic reconciliation below covers dropped events. */ });
+        .catch(() => { /* The debounced reload below still covers the catalog. */ });
       void refreshStatus();
-      void loadCatalog('', '');
     }
     return () => { alive.current = false; disposed = true; release?.(); };
   }, [native, refreshStatus, loadCatalog]);
@@ -88,13 +98,6 @@ export function useServices(native: boolean) {
     const timer = setTimeout(() => { void loadCatalog(query.trim(), category); }, query ? 300 : 0);
     return () => clearTimeout(timer);
   }, [query, category, native, loadCatalog]);
-
-  const attemptLive = isAttemptLive(snapshot?.attempt ?? null);
-  useEffect(() => {
-    if (!native || !attemptLive) return;
-    const timer = setInterval(() => { void refreshStatus(); }, 2000);
-    return () => clearInterval(timer);
-  }, [native, attemptLive, refreshStatus]);
 
   const connect = useCallback(async (service: string) => {
     if (!native) { setConnectError('Open the desktop app to connect services.'); return; }
@@ -109,11 +112,13 @@ export function useServices(native: boolean) {
   }, [native, refreshStatus]);
   const cancelConnect = useCallback(async (attemptId: string) => {
     try { await invoke('composio_cancel', { attemptId }); }
-    finally { await refreshStatus(); }
+    catch (failure) { setConnectError(message(failure)); }
+    finally { await refreshStatus().catch(() => {}); }
   }, [refreshStatus]);
   const disconnect = useCallback(async (connectedAccountId: string) => {
     try { await invoke('composio_disconnect', { connectedAccountId }); }
-    finally { await refreshStatus(); }
+    catch (failure) { setConnectError(message(failure)); }
+    finally { await refreshStatus().catch(() => {}); }
   }, [refreshStatus]);
   const saveKey = useCallback(async (apiKey: string) => {
     await invoke('composio_key_save', { apiKey });
@@ -150,6 +155,9 @@ export function useServicePrompts(native: boolean, enabled: boolean) {
   }, [native, enabled]);
   const dismiss = useCallback((workspaceId: string, service: string) => {
     setDismissed(current => [...current, `${workspaceId}:${service}`]);
+    void invoke('composio_prompt_dismiss', { workspaceId, service }).catch(() => {
+      /* Local dismissal stands; the host record expires by TTL. */
+    });
   }, []);
   const restore = useCallback((workspaceId: string, service: string) => {
     setDismissed(current => current.filter(key => key !== `${workspaceId}:${service}`));

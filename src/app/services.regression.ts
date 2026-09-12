@@ -232,7 +232,22 @@ export async function runServicesRegressionChecks() {
   assert.equal(connectCardPhase('github', { id: 'a', service: 'github', connectedAccountId: null, phase: 'pending', expiresAt: '', error: null, detail: null }, []), 'connecting');
   assert.equal(connectCardPhase('github', null, [{ id: 'x', service: 'github', status: 'connected', statusDetail: null, alias: null, wordId: null, connectedAt: null }]), 'success');
   assert.equal(catalogCountLine(10, 1500), 'Showing 10 of 1,500 services');
-  assert.ok(validComposioKey('ak_synthetic-key-1') && !validComposioKey('sk_nope') && !validComposioKey('ak_short'));
+  // Review round 1 regressions.
+  // F5: the TS key rule mirrors the native host rule (ak_ + >=13 = >=16 chars).
+  assert.ok(validComposioKey(`ak_${'a'.repeat(13)}`));
+  assert.ok(!validComposioKey(`ak_${'a'.repeat(12)}`), 'below the 16-char host minimum');
+  assert.ok(!validComposioKey('sk_nope') && !validComposioKey('ak_short'));
+  // F7: cancel/disconnect surface failures instead of unhandled rejections.
+  assert.ok((controllerSource.match(/catch \(failure\) \{ setConnectError\(message\(failure\)\); \}/g) ?? []).length >= 2,
+    'cancel and disconnect report errors');
+  // F8: no duplicate initial catalog fetch from the mount effect.
+  assert.doesNotMatch(controllerSource, /void loadCatalog\('', ''\);/);
+  // F9: no renderer polling interval; snapshots reconcile from native events
+  // and keep last known items while an attempt is live.
+  assert.doesNotMatch(controllerSource, /setInterval/);
+  assert.match(controllerSource, /isAttemptLive\(next\.attempt\)/);
+  // F3: dismissal lifts host-side prompt suppression.
+  assert.match(controllerSource, /invoke\('composio_prompt_dismiss', \{ workspaceId, service \}\)/);
 
   // Native lane parity: the Rust host owns every Composio call and secret.
   const native = readFileSync(new URL('../../src-tauri/src/connectors/composio.rs', import.meta.url), 'utf8');

@@ -30,7 +30,10 @@ const MAX_BODY_BYTES: usize = 512 * 1024;
 const MAX_CATALOG_LIMIT: u16 = 200;
 const MAX_PAGE_ITEMS: usize = 1_000;
 const MAX_ACCOUNTS: usize = 100;
+/// Single bound for both the fetch limit and the runtime tool projection (F5').
+const MAX_LIST_ITEMS: usize = 50;
 const MAX_PROMPTS: usize = 64;
+const PROMPT_TTL: Duration = Duration::from_secs(600);
 const CHANGE_EVENT: &str = "composio:changed";
 const PROMPT_EVENT: &str = "composio:connect-prompt";
 pub const RUNTIME_LIST_TOOL: &str = "forma_list_connected_services";
@@ -123,7 +126,7 @@ fn camel(name: &str) -> String {
 fn field<'a>(value: &'a Value, name: &str) -> Option<&'a Value> {
     value.get(name).or_else(|| value.get(&camel(name)))
 }
-fn bounded_str(value: &Value, name: &str, cap: usize) -> Option<&str> {
+fn bounded_str<'a>(value: &'a Value, name: &str, cap: usize) -> Option<&'a str> {
     field(value, name)
         .and_then(Value::as_str)
         .filter(|text| !text.is_empty() && text.len() <= cap)
@@ -189,7 +192,7 @@ pub struct ServiceStatus {
     pub word_id: Option<String>,
     pub connected_at: Option<String>,
 }
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Snapshot {
     pub revision: u64,
@@ -233,10 +236,14 @@ struct PromptRecord {
     workspace_id: String,
     service: String,
     run_id: String,
+    at: Instant,
 }
 struct Inner {
     revision: u64,
-    attempt: Option<Attempt>,
+    /// Live single-flight slot; only a terminal transition may clear it.
+    pending: Option<Attempt>,
+    /// Last attempt status for snapshots; outlives the live slot.
+    attempt_status: Option<AttemptStatus>,
     prompts: Vec<PromptRecord>,
 }
 pub struct ComposioCore {
@@ -263,7 +270,8 @@ impl ComposioState {
                 Ok(Arc::new(ComposioCore {
                     inner: Mutex::new(Inner {
                         revision: 0,
-                        attempt: None,
+                        pending: None,
+                        attempt_status: None,
                         prompts: Vec::new(),
                     }),
                     keys: Arc::new(ComposioKeyStore::new(self.test_directory.as_deref())),
@@ -309,7 +317,8 @@ impl ComposioCore {
             key: Arc::new(key),
         })
     }
-    /// Single-flight connection attempt; deadline expiry retires stale attempts.
+    /// Single-flight connection attempt; a terminal transition frees the slot
+    /// (F1) so the next start can begin without an app restart.
     fn begin_attempt(
         &self,
         service: &str,
@@ -317,24 +326,26 @@ impl ComposioCore {
     ) -> AppResult<(String, CancellationToken)> {
         let mut inner = lock_inner(self)?;
         Self::expire_locked(&mut inner);
-        if inner.attempt.is_some() {
+        if inner.pending.is_some() {
             return Err(pending_error());
         }
         let id = uuid::Uuid::new_v4().to_string();
         let cancel = CancellationToken::new();
-        inner.attempt = Some(Attempt {
-            status: AttemptStatus {
-                id: id.clone(),
-                service: service.to_owned(),
-                connected_account_id: None,
-                phase: AttemptPhase::Pending,
-                expires_at: chrono::Utc::now()
-                    .checked_add_signed(chrono::Duration::seconds(timeout.as_secs() as i64))
-                    .unwrap_or_else(chrono::Utc::now)
-                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-                error: None,
-                detail: None,
-            },
+        let status = AttemptStatus {
+            id: id.clone(),
+            service: service.to_owned(),
+            connected_account_id: None,
+            phase: AttemptPhase::Pending,
+            expires_at: chrono::Utc::now()
+                .checked_add_signed(chrono::Duration::seconds(timeout.as_secs() as i64))
+                .unwrap_or_else(chrono::Utc::now)
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            error: None,
+            detail: None,
+        };
+        inner.attempt_status = Some(status.clone());
+        inner.pending = Some(Attempt {
+            status,
             deadline: Instant::now() + timeout,
             cancel: cancel.clone(),
         });
@@ -343,16 +354,34 @@ impl ComposioCore {
     }
     fn expire_locked(inner: &mut Inner) {
         if inner
-            .attempt
+            .pending
             .as_ref()
             .is_some_and(|attempt| Instant::now() >= attempt.deadline)
         {
-            if let Some(mut attempt) = inner.attempt.take() {
-                attempt.status.phase = AttemptPhase::Failed;
-                attempt.status.error = Some(timeout_error());
-                attempt.cancel.cancel();
-                inner.attempt = Some(attempt);
+            Self::terminal_locked(inner, AttemptPhase::Failed, Some(timeout_error()), None);
+        }
+    }
+    /// Take the live slot, cancel it, and record the terminal status.
+    fn terminal_locked(
+        inner: &mut Inner,
+        phase: AttemptPhase,
+        error: Option<AppError>,
+        detail: Option<String>,
+    ) {
+        if let Some(pending) = inner.pending.take() {
+            pending.cancel.cancel();
+            let id = pending.status.id.clone();
+            if inner
+                .attempt_status
+                .as_ref()
+                .is_some_and(|status| status.id == id)
+            {
+                let status = inner.attempt_status.as_mut().unwrap();
+                status.phase = phase;
+                status.error = error;
+                status.detail = detail;
             }
+            inner.revision += 1;
         }
     }
     fn mutate_attempt<F: FnOnce(&mut Attempt) -> bool>(&self, id: &str, mutate: F) -> bool {
@@ -360,7 +389,7 @@ impl ComposioCore {
             return false;
         };
         Self::expire_locked(&mut inner);
-        let Some(attempt) = inner.attempt.as_mut() else {
+        let Some(attempt) = inner.pending.as_mut() else {
             return false;
         };
         if attempt.status.id != id {
@@ -368,6 +397,8 @@ impl ComposioCore {
         }
         let changed = mutate(attempt);
         if changed {
+            let status = attempt.status.clone();
+            inner.attempt_status = Some(status);
             inner.revision += 1;
         }
         changed
@@ -395,7 +426,7 @@ impl ComposioCore {
     fn check_attempt(&self, id: &str) -> AppResult<CancellationToken> {
         let mut inner = lock_inner(self)?;
         Self::expire_locked(&mut inner);
-        let attempt = inner.attempt.as_ref().ok_or_else(stale_error)?;
+        let attempt = inner.pending.as_ref().ok_or_else(stale_error)?;
         if attempt.status.id != id || attempt.cancel.is_cancelled() {
             return Err(stale_error());
         }
@@ -408,57 +439,71 @@ impl ComposioCore {
         error: Option<AppError>,
         detail: Option<String>,
     ) -> bool {
-        self.mutate_attempt(id, |attempt| {
-            if matches!(
-                attempt.status.phase,
-                AttemptPhase::Connected | AttemptPhase::Cancelled | AttemptPhase::Failed
-            ) {
-                return false;
-            }
-            attempt.status.phase = phase;
-            attempt.status.error = error;
-            attempt.status.detail = detail;
-            true
-        })
+        let Ok(mut inner) = lock_inner(self) else {
+            return false;
+        };
+        Self::expire_locked(&mut inner);
+        if !inner
+            .pending
+            .as_ref()
+            .is_some_and(|attempt| attempt.status.id == id)
+        {
+            return false;
+        }
+        Self::terminal_locked(&mut inner, phase, error, detail);
+        true
     }
     fn cancel_attempt(&self, id: &str) -> AppResult<()> {
         let mut inner = lock_inner(self)?;
         Self::expire_locked(&mut inner);
-        let Some(attempt) = inner.attempt.as_mut() else {
+        if !inner.pending.is_some() {
             return Err(AppError::new(
                 "not_found",
                 "That connection attempt was not found.",
             ));
-        };
-        if attempt.status.id != id {
+        }
+        if !inner
+            .pending
+            .as_ref()
+            .is_some_and(|attempt| attempt.status.id == id)
+        {
             return Err(stale_error());
         }
-        if matches!(
-            attempt.status.phase,
-            AttemptPhase::Connected | AttemptPhase::Cancelled | AttemptPhase::Failed
-        ) {
-            return Err(stale_error());
-        }
-        attempt.status.phase = AttemptPhase::Cancelled;
-        attempt.cancel.cancel();
-        inner.revision += 1;
+        Self::terminal_locked(&mut inner, AttemptPhase::Cancelled, None, None);
         Ok(())
     }
     fn snapshot_attempt(&self) -> Option<AttemptStatus> {
         let mut inner = lock_inner(self).ok()?;
         Self::expire_locked(&mut inner);
-        inner.attempt.as_ref().map(|attempt| attempt.status.clone())
+        inner.attempt_status.clone()
+    }
+    /// The live single-flight attempt only; terminal statuses do not count.
+    fn live_attempt(&self) -> Option<AttemptStatus> {
+        let mut inner = lock_inner(self).ok()?;
+        Self::expire_locked(&mut inner);
+        inner.pending.as_ref().map(|attempt| attempt.status.clone())
     }
     fn revision(&self) -> u64 {
         lock_inner(self).map(|inner| inner.revision).unwrap_or(0)
     }
-    /// Hermes tool prompts are deduplicated per workspace+service; rendering
-    /// the card is a host decision, never message text.
+    /// Hermes tool prompts are deduplicated per workspace+service with a TTL;
+    /// rendering the card is a host decision, never message text. Suppression
+    /// lifts on dismissal, disconnect, connection, or expiry (F3).
     fn should_prompt(&self, workspace_id: &str, service: &str, run_id: &str) -> bool {
         let Ok(mut inner) = lock_inner(self) else {
             return false;
         };
-        if let Some(record) = inner
+        let now = Instant::now();
+        let expired = inner.prompts.iter().any(|record| {
+            record.workspace_id == workspace_id
+                && record.service == service
+                && now >= record.at + PROMPT_TTL
+        });
+        if expired {
+            inner.prompts.retain(|record| {
+                !(record.workspace_id == workspace_id && record.service == service)
+            });
+        } else if let Some(record) = inner
             .prompts
             .iter_mut()
             .find(|record| record.workspace_id == workspace_id && record.service == service)
@@ -473,12 +518,25 @@ impl ComposioCore {
             workspace_id: workspace_id.to_owned(),
             service: service.to_owned(),
             run_id: run_id.to_owned(),
+            at: now,
         });
         true
     }
     fn resolve_prompt_for_service(&self, service: &str) {
         if let Ok(mut inner) = lock_inner(self) {
             inner.prompts.retain(|record| record.service != service);
+        }
+    }
+    fn resolve_all_prompts(&self) {
+        if let Ok(mut inner) = lock_inner(self) {
+            inner.prompts.clear();
+        }
+    }
+    fn dismiss_prompt(&self, workspace_id: &str, service: &str) {
+        if let Ok(mut inner) = lock_inner(self) {
+            inner.prompts.retain(|record| {
+                !(record.workspace_id == workspace_id && record.service == service)
+            });
         }
     }
 }
@@ -504,7 +562,9 @@ impl ComposioHttp {
         let mut bearer = HeaderValue::from_str(&format!("Bearer {}", self.key.as_str()))
             .map_err(|_| AppError::invalid())?;
         bearer.set_sensitive(true);
-        let api_key = HeaderValue::from_str(self.key.as_str()).map_err(|_| AppError::invalid())?;
+        let mut api_key =
+            HeaderValue::from_str(self.key.as_str()).map_err(|_| AppError::invalid())?;
+        api_key.set_sensitive(true);
         Ok((bearer, api_key))
     }
 }
@@ -619,6 +679,12 @@ fn parse_service(item: &Value) -> AppResult<ToolkitSummary> {
             .unwrap_or(false),
     })
 }
+fn parse_services(items: &[Value]) -> Vec<ToolkitSummary> {
+    items
+        .iter()
+        .filter_map(|item| parse_service(item).ok())
+        .collect()
+}
 fn parse_page(value: &Value) -> AppResult<(Vec<Value>, u64)> {
     let items = field(value, "items")
         .and_then(Value::as_array)
@@ -680,22 +746,20 @@ async fn categories(transport: &dyn Transport) -> AppResult<Vec<Category>> {
     let url = api("/toolkits/categories")?;
     let bytes = transport.request(reqwest::Method::GET, url, None).await?;
     let (items, _) = parse_page(&decode_json(&bytes)?)?;
-    items
+    Ok(items
         .iter()
         .take(64)
-        .map(|item| {
-            Ok(Category {
-                name: bounded_str(item, "name", 80)
-                    .ok_or_else(data_error)?
-                    .to_owned(),
-                id: bounded_str(item, "id", 64)
-                    .filter(|id| valid_service_slug(id))
-                    .ok_or_else(data_error)?
-                    .to_owned(),
+        .filter_map(|item| {
+            let name = bounded_str(item, "name", 80)?;
+            let id = bounded_str(item, "id", 64).filter(|id| valid_service_slug(id))?;
+            Some(Category {
+                name: name.to_owned(),
+                id: id.to_owned(),
             })
         })
-        .collect()
+        .collect())
 }
+#[derive(Debug)]
 struct AuthConfigRow {
     id: String,
     auth_scheme: String,
@@ -771,7 +835,7 @@ async fn connected_accounts(
 ) -> AppResult<Vec<ServiceStatus>> {
     let mut url = api("/connected_accounts")?;
     url.query_pairs_mut()
-        .append_pair("limit", &MAX_ACCOUNTS.to_string());
+        .append_pair("limit", &MAX_LIST_ITEMS.to_string());
     if let Some(service) = service {
         url.query_pairs_mut().append_pair("toolkit_slugs", service);
     }
@@ -780,7 +844,10 @@ async fn connected_accounts(
     if items.len() > MAX_ACCOUNTS {
         return Err(data_error());
     }
-    items.iter().map(|item| parse_account(item)).collect()
+    Ok(items
+        .iter()
+        .filter_map(|item| parse_account(item).ok())
+        .collect())
 }
 async fn account(transport: &dyn Transport, id: &str) -> AppResult<ServiceStatus> {
     if !valid_composio_id(id) {
@@ -862,7 +929,17 @@ pub async fn composio_status(window: WebviewWindow, app: AppHandle) -> AppResult
     let attempt = core.snapshot_attempt();
     let revision = core.revision();
     let key_configured = core.keys.has();
-    let items = if key_configured {
+    // While the native callback thread drives a live attempt, snapshots stay
+    // in memory: no extra Composio round trips from renderer polling (F9).
+    // That thread emits composio:changed on every transition; the snapshot
+    // after it reconciles the authoritative account list.
+    let attempt_live = attempt.as_ref().is_some_and(|status| {
+        matches!(
+            status.phase,
+            AttemptPhase::Pending | AttemptPhase::Confirming
+        )
+    });
+    let items = if key_configured && !attempt_live {
         let http = core.http()?;
         connected_accounts(&http, None).await?
     } else {
@@ -885,7 +962,7 @@ pub async fn composio_catalog(
 ) -> AppResult<CatalogPage> {
     crate::first_party(&window)?;
     let search = search
-        .map(|value| {
+        .map(|value| -> AppResult<String> {
             crate::validation::single_line(&value, 120, true)?;
             Ok(value.trim().to_owned())
         })
@@ -905,11 +982,12 @@ pub async fn composio_catalog(
     let http = core.http()?;
     let (items, total_items) =
         catalog_page(&http, search.as_deref(), category.as_deref(), limit).await?;
-    let items = items
-        .iter()
-        .map(|item| parse_service(item))
-        .collect::<AppResult<Vec<_>>>()?;
-    Ok(CatalogPage { items, total_items })
+    // A malformed row is skipped, never a whole-page failure (F6); page-level
+    // bounds (size, totals) still fail closed.
+    Ok(CatalogPage {
+        items: parse_services(&items),
+        total_items,
+    })
 }
 #[tauri::command]
 pub async fn composio_categories(
@@ -963,24 +1041,27 @@ pub async fn composio_start(
     emit_change(&app);
     // The redirect URL stays native-owned and is only passed to the system
     // browser opener; the renderer never receives it.
-    let mut lease = LaunchLease {
-        core: &core,
-        id: &id,
-        admitted: false,
-    };
-    let launch = {
+    let launched = {
+        let mut lease = LaunchLease {
+            core: &core,
+            id: &id,
+            admitted: false,
+        };
+        let launch = {
+            core.check_attempt(&id)?;
+            lease.admitted = true;
+            super::opener::spawn(&link.redirect_url)?
+        };
+        let launched = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => false,
+            _ = tokio::time::sleep(OPEN_TIMEOUT) => false,
+            result = launch => result.is_ok(),
+        };
         core.check_attempt(&id)?;
-        lease.admitted = true;
-        super::opener::spawn(&link.redirect_url)?
+        lease.admitted = false;
+        launched
     };
-    let launched = tokio::select! {
-        biased;
-        _ = cancel.cancelled() => false,
-        _ = tokio::time::sleep(OPEN_TIMEOUT) => false,
-        result = launch => result.is_ok(),
-    };
-    core.check_attempt(&id)?;
-    lease.admitted = false;
     if !launched {
         let error = browser_error();
         core.finish_attempt(&id, AttemptPhase::Failed, Some(error.clone()), None);
@@ -1063,8 +1144,28 @@ pub async fn composio_disconnect(
     let core = core(&app)?;
     let http = core.http()?;
     let result = disconnect_account(&http, &connected_account_id).await;
+    if result.is_ok() {
+        // A disconnect changes connection state; stale prompt suppression lifts.
+        core.resolve_all_prompts();
+    }
     emit_change(&app);
     result
+}
+#[tauri::command]
+pub async fn composio_prompt_dismiss(
+    window: WebviewWindow,
+    app: AppHandle,
+    workspace_id: String,
+    service: String,
+) -> AppResult<()> {
+    crate::first_party(&window)?;
+    uuid::Uuid::parse_str(&workspace_id).map_err(|_| AppError::invalid())?;
+    if !valid_service_slug(&service) {
+        return Err(AppError::invalid());
+    }
+    let core = core(&app)?;
+    core.dismiss_prompt(&workspace_id, &service);
+    Ok(())
 }
 #[tauri::command]
 pub async fn composio_key_save(
@@ -1130,7 +1231,7 @@ async fn list_connected_services(core: &Arc<ComposioCore>) -> AppResult<Value> {
 fn list_value(accounts: &[ServiceStatus], configured: bool) -> Value {
     let items: Vec<Value> = accounts
         .iter()
-        .take(50)
+        .take(MAX_LIST_ITEMS)
         .map(|account| json!({ "slug": account.service, "status": account.status }))
         .collect();
     json!({
@@ -1201,13 +1302,8 @@ async fn evaluate_connection(
     if accounts.iter().any(|account| account.status == "connected") {
         return Ok((status("already_connected"), false));
     }
-    if let Some(attempt) = core.snapshot_attempt() {
-        if attempt.service == service
-            && matches!(
-                attempt.phase,
-                AttemptPhase::Pending | AttemptPhase::Confirming
-            )
-        {
+    if let Some(attempt) = core.live_attempt() {
+        if attempt.service == service {
             return Ok((status("initiated"), false));
         }
     }
@@ -1263,7 +1359,8 @@ mod tests {
         Arc::new(ComposioCore {
             inner: Mutex::new(Inner {
                 revision: 0,
-                attempt: None,
+                pending: None,
+                attempt_status: None,
                 prompts: Vec::new(),
             }),
             keys: Arc::new(keys),
@@ -1495,7 +1592,7 @@ mod tests {
                 &cancel,
             )
             .await;
-            assert_eq!(result.map_err(|error| error.code).unwrap_or("ok"), code);
+            assert_eq!(result.err().map(|error| error.code).unwrap_or("ok"), code);
         }
         let cancel = CancellationToken::new();
         cancel.cancel();
@@ -1548,11 +1645,12 @@ mod tests {
             core.snapshot_attempt().unwrap().phase,
             AttemptPhase::Cancelled
         );
-        assert_eq!(
-            core.cancel_attempt(&first).unwrap_err().code,
-            "composio_stale"
-        );
+        // A terminal attempt frees the single-flight slot (F1): a second cancel
+        // is not_found, a finish is a no-op, and a new attempt can begin.
+        assert_eq!(core.cancel_attempt(&first).unwrap_err().code, "not_found");
         assert!(!core.finish_attempt(&first, AttemptPhase::Connected, None, None));
+        assert!(core.live_attempt().is_none());
+        assert!(core.snapshot_attempt().is_some());
         let (second, _) = core
             .begin_attempt("notion", Duration::from_secs(60))
             .unwrap();
@@ -1561,12 +1659,116 @@ mod tests {
         let snapshot = core.snapshot_attempt().unwrap();
         assert_eq!(snapshot.phase, AttemptPhase::Failed);
         assert_eq!(snapshot.error.as_ref().unwrap().code, "composio_network");
-        // Deadline expiry retires stale attempts with an honest timeout.
+        let (fourth, _) = core
+            .begin_attempt("figma", Duration::from_secs(60))
+            .unwrap();
+        core.finish_attempt(&fourth, AttemptPhase::Connected, None, None);
+        // Deadline expiry retires stale attempts with an honest timeout and
+        // also frees the slot for the next attempt.
         let (third, _) = core.begin_attempt("slack", Duration::ZERO).unwrap();
         let snapshot = core.snapshot_attempt().unwrap();
         assert_eq!(snapshot.id, third);
         assert_eq!(snapshot.phase, AttemptPhase::Failed);
         assert_eq!(snapshot.error.as_ref().unwrap().code, "composio_timeout");
+        assert!(core.begin_attempt("asana", Duration::from_secs(60)).is_ok());
+    }
+
+    #[test]
+    fn prompt_suppression_lifts_on_dismissal_resolve_and_ttl() {
+        let core = core_with(MemoryKeys::default());
+        assert!(core.should_prompt("w1", "github", "r1"));
+        assert!(
+            !core.should_prompt("w1", "github", "r2"),
+            "suppressed while live"
+        );
+        assert!(
+            core.should_prompt("w2", "github", "r3"),
+            "other workspace unaffected"
+        );
+        // Dismissal lifts suppression for that workspace+service (F3).
+        core.dismiss_prompt("w1", "github");
+        assert!(core.should_prompt("w1", "github", "r4"));
+        // A connection resolves suppression for the service everywhere.
+        assert!(!core.should_prompt("w1", "github", "r5"));
+        core.resolve_prompt_for_service("github");
+        assert!(core.should_prompt("w1", "github", "r6"));
+        assert!(core.should_prompt("w2", "github", "r7"));
+        core.resolve_all_prompts();
+        assert!(core.should_prompt("w2", "github", "r8"));
+        // TTL expiry re-arms re-emission instead of suppressing forever (F3).
+        assert!(!core.should_prompt("w2", "github", "r9"));
+        {
+            let mut inner = core.inner.lock().unwrap();
+            for record in &mut inner.prompts {
+                record.at = record
+                    .at
+                    .checked_sub(PROMPT_TTL + Duration::from_secs(1))
+                    .unwrap();
+            }
+        }
+        assert!(
+            core.should_prompt("w2", "github", "r10"),
+            "expired record re-emits"
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_rows_are_skipped_not_page_fatal() {
+        let mixed = json!([
+            service_fixture(),
+            {"name": "MissingSlug"},
+            {"slug": "broken-name"},
+            {"slug": "linear", "name": "Linear"}
+        ]);
+        let parsed = parse_services(mixed.as_array().unwrap());
+        assert_eq!(
+            parsed
+                .iter()
+                .map(|service| service.slug.as_str())
+                .collect::<Vec<_>>(),
+            vec!["github", "linear"]
+        );
+        let accounts = json!([
+            {"id": "abc123def456", "toolkit": {"slug": "github"}, "status": "ACTIVE"},
+            {"id": "nodomain-nope", "status": "ACTIVE"},
+            {"toolkit": {"slug": "linear"}, "status": "ACTIVE"}
+        ]);
+        let transport = FixtureTransport::new(vec![ok(page(accounts, 3))]);
+        let parsed = connected_accounts(&transport, None).await.unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].service, "github");
+        let cats = json!([
+            {"name": "Developer Tools", "id": "developer-tools"},
+            {"name": "No Id"},
+            {"name": "Bad Id", "id": "NOT-VALID"},
+            {"name": "Productivity", "id": "productivity"}
+        ]);
+        let transport = FixtureTransport::new(vec![ok(page(cats, 4))]);
+        let parsed = categories(&transport).await.unwrap();
+        assert_eq!(
+            parsed
+                .iter()
+                .map(|category| category.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["developer-tools", "productivity"]
+        );
+    }
+
+    #[test]
+    fn live_attempt_and_status_mirror_split_after_terminals() {
+        let core = core_with(MemoryKeys::default());
+        let (id, _) = core
+            .begin_attempt("github", Duration::from_secs(60))
+            .unwrap();
+        assert!(core.live_attempt().is_some());
+        core.finish_attempt(&id, AttemptPhase::Connected, None, None);
+        assert!(
+            core.live_attempt().is_none(),
+            "terminal frees the live slot"
+        );
+        let snapshot = core.snapshot_attempt().unwrap();
+        assert_eq!(snapshot.phase, AttemptPhase::Connected);
+        assert_eq!(snapshot.id, id);
     }
     #[tokio::test]
     async fn runtime_tools_return_honest_statuses_and_dedupe_prompts() {
@@ -1640,6 +1842,10 @@ mod tests {
         let (bearer, api_key) = http.key_header().unwrap();
         assert_eq!(bearer.to_str().unwrap(), "Bearer ak_synthetic-key-123456");
         assert!(bearer.is_sensitive());
+        assert!(
+            api_key.is_sensitive(),
+            "x-api-key must also be marked sensitive"
+        );
         assert_eq!(api_key.to_str().unwrap(), "ak_synthetic-key-123456");
         // Error messages are static and never embed the key.
         for error in [

@@ -70,6 +70,27 @@ class ComposioContractCase(unittest.TestCase):
         google_args(google_request["args"])
         with self.assertRaises(Fault): composio_result(base, google_request)
 
+    def test_missing_required_fields_raise_fault_not_keyerror(self):
+        # F4 regression: fields indexed by composio_result are required; a
+        # missing status/items raises an invalid_request Fault (422 wire
+        # shape), never an unhandled KeyError.
+        list_request = {"toolName": COMPOSIO_TOOLS[0], "args": {}}
+        connect_request = {"toolName": COMPOSIO_TOOLS[1], "args": {"service": "github"}}
+        for invalid in ({"kind": "connectedServices"},
+                        {"kind": "connectedServices", "configured": True},
+                        {"items": []}):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(Fault) as raised:
+                    composio_result(invalid, list_request)
+                self.assertEqual(raised.exception.code, "invalid_request")
+        for invalid in ({"kind": "serviceConnectionRequest", "service": "github"},
+                        {"kind": "serviceConnectionRequest", "status": "failed"},
+                        {"service": "github", "status": "failed"}):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(Fault) as raised:
+                    composio_result(invalid, connect_request)
+                self.assertEqual(raised.exception.code, "invalid_request")
+
     def test_allowlist_and_google_tools_unchanged(self):
         self.assertIn(COMPOSIO_TOOLS[0], TOOLS)
         self.assertIn(COMPOSIO_TOOLS[1], TOOLS)

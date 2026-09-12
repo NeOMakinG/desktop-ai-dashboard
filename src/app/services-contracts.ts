@@ -113,5 +113,7 @@ export function promptsForWorkspace(prompts: readonly ServicePrompt[], dismissed
     .map(prompt => ({ prompt, dismissed: dismissed.includes(`${prompt.workspaceId}:${prompt.service}`) }));
 }
 export function validComposioKey(value: string): boolean {
-  return /^ak_[A-Za-z0-9_-]{6,}$/.test(value.trim()) && value.trim().length <= 4096;
+  // Mirrors the native host rule: ak_ prefix plus at least 13 more characters
+  // (16 total), printable key characters only, bounded length.
+  return /^ak_[A-Za-z0-9_-]{13,}$/.test(value.trim()) && value.trim().length <= 4096;
 }

@@ -582,9 +582,12 @@ async fn dispatch_tool(
     // Composio connection tools are grant-free by design: they expose only
     // host-validated connect/status prompts and never read account data, so
     // neither grant containment nor connection identity applies to them.
+    // (Accepted asymmetry: Google reads stay strictly gated; prompts cannot
+    // exfiltrate because they carry no account payload either way.)
     let composio_tool = matches!(
         tool.tool_name.as_str(),
-        "forma_list_connected_services" | "forma_request_service_connection"
+        crate::connectors::composio::RUNTIME_LIST_TOOL
+            | crate::connectors::composio::RUNTIME_CONNECT_TOOL
     );
     if tool.run_id != request.progress.request_id
         || tool.workspace_id != request.input.workspace_id
@@ -634,14 +637,33 @@ async fn dispatch_tool(
     let mut delivery_context: Option<RuntimeReadContext> = None;
     let result: AppResult<Value> = match operation {
         None => {
-            crate::connectors::dispatch_runtime_tool(
-                app,
-                &tool.workspace_id,
-                &tool.run_id,
-                &tool.tool_name,
-                &tool.args,
+            // Native Composio work is bounded by the claim window (F2): an
+            // overrun reports an honest unavailable outcome instead of
+            // expiring the claim with no tool result posted. The margin keeps
+            // the result post inside the claim deadline.
+            let remaining = claim_deadline
+                .signed_duration_since(chrono::Utc::now())
+                .to_std()
+                .unwrap_or_default();
+            let bound = remaining.saturating_sub(std::time::Duration::from_secs(2));
+            match tokio::time::timeout(
+                bound,
+                crate::connectors::dispatch_runtime_tool(
+                    app,
+                    &tool.workspace_id,
+                    &tool.run_id,
+                    &tool.tool_name,
+                    &tool.args,
+                ),
             )
             .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(AppError::new(
+                    "composio_timeout",
+                    "The connector host did not answer within the tool claim window.",
+                )),
+            }
         }
         Some(operation) => {
             let context = RuntimeReadContext {

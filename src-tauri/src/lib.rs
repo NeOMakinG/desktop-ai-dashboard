@@ -422,6 +422,7 @@ pub fn run() {
             connectors::composio::composio_disconnect,
             connectors::composio::composio_key_save,
             connectors::composio::composio_key_remove,
+            connectors::composio::composio_prompt_dismiss,
             runtime::runtime_status,
             runtime::runtime_retry,
             runtime::runtime_check,

@@ -120,9 +120,10 @@ impl ComposioKeys for ComposioKeyStore {
         Ok(Zeroizing::new(value))
     }
     fn has(&self) -> bool {
-        self.entry()
-            .and_then(|entry| entry.get_password().map(|value| !value.is_empty()))
-            .unwrap_or(false)
+        let Ok(entry) = self.entry() else {
+            return false;
+        };
+        matches!(entry.get_password(), Ok(value) if !value.is_empty())
     }
     fn write(&self, key: &str) -> AppResult<()> {
         self.entry()?
