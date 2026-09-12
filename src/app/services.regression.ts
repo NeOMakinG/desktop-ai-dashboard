@@ -242,10 +242,15 @@ export async function runServicesRegressionChecks() {
     'cancel and disconnect report errors');
   // F8: no duplicate initial catalog fetch from the mount effect.
   assert.doesNotMatch(controllerSource, /void loadCatalog\('', ''\);/);
-  // F9: no renderer polling interval; snapshots reconcile from native events
-  // and keep last known items while an attempt is live.
-  assert.doesNotMatch(controllerSource, /setInterval/);
+  // F9: no 2-second renderer polling during live attempts; snapshots reconcile
+  // from native events and keep last known items while an attempt is live.
+  assert.doesNotMatch(controllerSource, /, 2000\)/);
   assert.match(controllerSource, /isAttemptLive\(next\.attempt\)/);
+  // N1: a failed composio:changed registration surfaces an error and starts a
+  // coarse 30s fallback refresh that stops on re-registration or unmount.
+  assert.match(controllerSource, /Live service updates are unavailable right now\./);
+  assert.match(controllerSource, /setInterval\(\(\) => \{\s*if \(!disposed\) \{ void refreshStatus\(\); register\(\); \}\s*\}, 30000\)/);
+  assert.match(controllerSource, /if \(fallback\) \{ clearInterval\(fallback\); fallback = undefined; \}/);
   // F3: dismissal lifts host-side prompt suppression.
   assert.match(controllerSource, /invoke\('composio_prompt_dismiss', \{ workspaceId, service \}\)/);
 

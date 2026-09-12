@@ -80,16 +80,40 @@ export function useServices(native: boolean) {
     alive.current = true;
     let disposed = false;
     let release: (() => void) | undefined;
+    let fallback: ReturnType<typeof setInterval> | undefined;
     if (native) {
       void invoke<ServiceCategory[]>('composio_categories')
         .then(items => { if (!disposed) setCategories(items); })
         .catch(() => { /* Categories are optional; the catalog still loads. */ });
-      void listen('composio:changed', () => { if (!disposed) void refreshStatus(); })
-        .then(unlisten => { if (disposed) unlisten(); else release = unlisten; })
-        .catch(() => { /* The debounced reload below still covers the catalog. */ });
+      const register = () => {
+        void listen('composio:changed', () => { if (!disposed) void refreshStatus(); })
+          .then(unlisten => {
+            if (disposed) { unlisten(); return; }
+            release = unlisten;
+            if (fallback) { clearInterval(fallback); fallback = undefined; }
+          })
+          .catch(() => {
+            if (disposed) return;
+            // Without change events nothing reconciles (no polling by design,
+            // F9): surface it and fall back to a coarse 30s refresh until the
+            // listener registers again or the surface unmounts (N1).
+            if (alive.current) setStatusError('Live service updates are unavailable right now. Refreshing every 30 seconds.');
+            if (!fallback) {
+              fallback = setInterval(() => {
+                if (!disposed) { void refreshStatus(); register(); }
+              }, 30000);
+            }
+          });
+      };
+      register();
       void refreshStatus();
     }
-    return () => { alive.current = false; disposed = true; release?.(); };
+    return () => {
+      alive.current = false;
+      disposed = true;
+      release?.();
+      if (fallback) clearInterval(fallback);
+    };
   }, [native, refreshStatus, loadCatalog]);
 
   // Debounced live search; category switches reload immediately.
