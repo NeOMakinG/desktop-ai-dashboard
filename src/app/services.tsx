@@ -4,7 +4,7 @@ import { InlineError, SafeImage } from './components';
 import type { ServicesController } from './services-controller';
 import {
   CATALOG_INITIAL_ROWS,
-  CATALOG_RENDER_CAP,
+  CATALOG_RENDER_MAX,
   CATALOG_STEP,
   catalogCountLine,
   chipsFromCategories,
@@ -57,7 +57,7 @@ export function ServiceRow({ service, connecting, onCancelConnect, onConnect }: 
 export function ServiceResults({ surface }: { surface: CatalogSurface }) {
   const [shown, setShown] = useState(CATALOG_INITIAL_ROWS);
   useEffect(() => { setShown(CATALOG_INITIAL_ROWS); }, [surface.query, surface.category]);
-  const visible = surface.items.slice(0, Math.min(shown, CATALOG_RENDER_CAP));
+  const visible = surface.items.slice(0, Math.min(shown, CATALOG_RENDER_MAX));
   const { query, error, loading, items } = surface;
   return <div className="service-results">
     {!query && !error && !loading && items.length > 0 && <p className="service-list-heading">Popular services</p>}
@@ -72,7 +72,7 @@ export function ServiceResults({ surface }: { surface: CatalogSurface }) {
       {visible.map(service => <ServiceRow key={service.slug} service={service}
         connecting={surface.connectingService === service.slug}
         onCancelConnect={surface.onCancelConnect} onConnect={surface.onConnect} />)}
-      {shown < Math.min(items.length, CATALOG_RENDER_CAP) && <button type="button" className="text-button muted service-more" onClick={() => setShown(value => value + CATALOG_STEP)}>Show 10 more</button>}
+      {shown < Math.min(items.length, CATALOG_RENDER_MAX) && <button type="button" className="text-button muted service-more" onClick={() => setShown(value => value + CATALOG_STEP)}>Show 10 more</button>}
       <p className="service-count">{catalogCountLine(visible.length, surface.totalItems)}</p>
     </div>}
   </div>;

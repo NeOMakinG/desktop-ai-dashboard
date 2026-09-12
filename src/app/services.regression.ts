@@ -5,7 +5,7 @@ import { createElement, type ReactElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { transformWithOxc } from 'vite';
 import {
-  CATALOG_RENDER_CAP,
+  CATALOG_RENDER_MAX,
   CATALOG_STEP,
   catalogCountLine,
   chipsFromCategories,
@@ -108,13 +108,21 @@ export async function runServicesRegressionChecks() {
   const ServiceChips = services.ServiceChips as (props: { categories: { id: string; name: string }[]; selected: string; onSelect: (id: string) => void }) => ReactElement;
   const html = renderToStaticMarkup(createElement(ServiceResults, { surface: fixtureSurface() }));
   const rows = html.match(/<div class="account-row service-row"/g) ?? [];
-  assert.ok(rows.length > 0 && rows.length <= CATALOG_RENDER_CAP, `row count ${rows.length}`);
+  assert.ok(rows.length > 0 && rows.length <= CATALOG_RENDER_MAX, `row count ${rows.length}`);
   assert.equal((html.match(/<div class="account-row service-row"/g) ?? []).length, 10, 'initial page shows 10 rows');
   assert.ok(html.includes('Showing 10 of 1,500 services'), html.slice(0, 200));
   assert.match(html, /class="service-count"/);
   assert.ok(html.includes('>Show 10 more</button>'));
   assert.equal(CATALOG_STEP, 10);
-  assert.equal(Math.min(CATALOG_STEP + 10, CATALOG_RENDER_CAP), 20, 'Show 10 more increments by exactly 10');
+  assert.equal(Math.min(CATALOG_STEP + 10, CATALOG_RENDER_MAX), 20, 'Show 10 more increments by exactly 10');
+  // C1: every fetched row is reachable — repeated paging reaches the fetch
+  // bound, and the honest count line always shows the real catalog total.
+  assert.equal(CATALOG_RENDER_MAX, 100);
+  let paged = CATALOG_STEP;
+  while (paged < CATALOG_RENDER_MAX) paged += CATALOG_STEP;
+  assert.equal(paged, CATALOG_RENDER_MAX, 'paging reaches every fetched row');
+  const full = renderToStaticMarkup(createElement(ServiceResults, { surface: fixtureSurface({ items: Array.from({ length: 100 }, (_, index) => fixtureService(index)), totalItems: 100 }) }));
+  assert.equal((full.match(/<div class="account-row service-row"/g) ?? []).length, 10, 'static render still starts at one page');
   assert.equal(chipsFromCategories([{ id: 'a', name: 'A' }, { id: 'b', name: 'B' }]).length, 3);
   const many = Array.from({ length: 30 }, (_, index) => ({ id: `cat-${index}`, name: `Category ${index}` }));
   const chipsHtml = renderToStaticMarkup(createElement(ServiceChips, { categories: many, selected: '', onSelect: () => {} }));
@@ -233,9 +241,14 @@ export async function runServicesRegressionChecks() {
   assert.equal(connectCardPhase('github', null, [{ id: 'x', service: 'github', status: 'connected', statusDetail: null, alias: null, wordId: null, connectedAt: null }]), 'success');
   assert.equal(catalogCountLine(10, 1500), 'Showing 10 of 1,500 services');
   // Review round 1 regressions.
-  // F5: the TS key rule mirrors the native host rule (ak_ + >=13 = >=16 chars).
+  // F5/C2: the TS key rule mirrors the native host rule exactly — ak_ prefix,
+  // 16..=4096 total, printable ASCII 33-126 (dots allowed, whitespace not).
   assert.ok(validComposioKey(`ak_${'a'.repeat(13)}`));
+  assert.ok(validComposioKey('ak_live.2fXy-9Qm.Zt01'), 'printable punctuation is accepted');
   assert.ok(!validComposioKey(`ak_${'a'.repeat(12)}`), 'below the 16-char host minimum');
+  assert.ok(!validComposioKey('ak_live 2fXy9QmZt01u'), 'whitespace rejected');
+  assert.ok(!validComposioKey('ak_live\t2fXy9QmZt01'), 'control characters rejected');
+  assert.ok(!validComposioKey('ak_unicode-ключ-123'), 'non-ASCII rejected');
   assert.ok(!validComposioKey('sk_nope') && !validComposioKey('ak_short'));
   // F7: cancel/disconnect surface failures instead of unhandled rejections.
   assert.ok((controllerSource.match(/catch \(failure\) \{ setConnectError\(message\(failure\)\); \}/g) ?? []).length >= 2,
@@ -266,7 +279,7 @@ export async function runServicesRegressionChecks() {
 
   return [
     'services css keeps token and spacing discipline with bounded catalog geometry',
-    'catalog caps at 30 rows with honest tabular counts and a 12-chip ceiling',
+    'catalog pages through every fetched row (fetch-bound cap) with honest tabular counts and a 12-chip ceiling',
     'onboarding services step keeps Connect later and an unblocked Continue',
     'loading, snapshot-error, empty-search and connecting states stay honest',
     'available rows never claim Connected; connected rows show account identity',

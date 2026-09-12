@@ -41,7 +41,10 @@ export interface LiveServicePrompt { prompt: ServicePrompt; dismissed: boolean }
 export type ConnectCardPhase = 'idle' | 'connecting' | 'success' | 'failed';
 
 export const CATALOG_INITIAL_ROWS = 10;
-export const CATALOG_RENDER_CAP = 30;
+/** Upper bound for both the native fetch limit and rendered rows: "Show 10
+ * more" pages through every fetched row (C1); the count line keeps the real
+ * catalog total visible so truncation is never hidden. */
+export const CATALOG_RENDER_MAX = 100;
 export const CATALOG_STEP = 10;
 export const MAX_PROMPT_CARDS = 3;
 
@@ -113,7 +116,14 @@ export function promptsForWorkspace(prompts: readonly ServicePrompt[], dismissed
     .map(prompt => ({ prompt, dismissed: dismissed.includes(`${prompt.workspaceId}:${prompt.service}`) }));
 }
 export function validComposioKey(value: string): boolean {
-  // Mirrors the native host rule: ak_ prefix plus at least 13 more characters
-  // (16 total), printable key characters only, bounded length.
-  return /^ak_[A-Za-z0-9_-]{13,}$/.test(value.trim()) && value.trim().length <= 4096;
+  // Mirrors the native host rule exactly: ak_ prefix, 16..=4096 characters
+  // total, printable ASCII (33-126) only — dots and other printable key
+  // characters are accepted, whitespace and controls are not.
+  const trimmed = value.trim();
+  if (!trimmed.startsWith('ak_') || trimmed.length < 16 || trimmed.length > 4096) return false;
+  for (let index = 0; index < trimmed.length; index++) {
+    const code = trimmed.charCodeAt(index);
+    if (code < 33 || code > 126) return false;
+  }
+  return true;
 }
