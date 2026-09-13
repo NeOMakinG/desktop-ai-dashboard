@@ -11,6 +11,7 @@ src-tauri/target/
 src-tauri/gen/
 # Generated, checksummed managed Python / Hermes distribution (never profiles).
 src-tauri/resources/managed-hermes/
+src-tauri/resources/managed-browsers/
 .DS_Store
 *.local
 

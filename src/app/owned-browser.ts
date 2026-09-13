@@ -7,6 +7,7 @@ const unavailable: OwnedBrowserStatus = {
   revision: 0, available: false, phase: 'unavailable', engine: 'unavailable', persistent: false,
   availableEngines: [], chromiumUnavailableReason: null,
   profileId: null, url: null, service: null, error: null, automationReady: false,
+  interactive: false, navigating: false,
 };
 
 function message(error: unknown): string {
@@ -81,7 +82,7 @@ export function useOwnedBrowser(native: boolean) {
     native, status, actionPending: busy, busy: busy || status.phase === 'opening', error: error || status.error,
     clearError: () => setError(null),
     refresh: () => refresh().then(next => { setError(null); return next; }).catch(failure => { setError(message(failure)); return unavailable; }),
-    open: (service: BrowserService = 'home', url?: string, engine: BrowserEngine = 'webkit') => run('browser_open', { service, ...(url ? { url } : {}), engine }),
+    open: (service: BrowserService = 'home', url?: string, engine?: BrowserEngine) => run('browser_open', { service, ...(url ? { url } : {}), ...(engine ? { engine } : {}) }),
     navigate: (url: string) => run('browser_navigate', { url }),
     back: () => run('browser_back'),
     forward: () => run('browser_forward'),

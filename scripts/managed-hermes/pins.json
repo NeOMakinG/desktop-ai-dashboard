@@ -18,7 +18,9 @@
           "file": "python/lib/python3.12/site-packages/PIL/.dylibs/libjpeg.62.4.0.dylib",
           "sha256": "cf7c4e5c2d2c007fc51afcb95b649415cfe0bc4d7137ace897a6eff6550fa967",
           "path": "/Users/runner/work/Pillow/Pillow/build/deps/darwin/lib",
-          "loads": ["/usr/lib/libSystem.B.dylib"],
+          "loads": [
+            "/usr/lib/libSystem.B.dylib"
+          ],
           "reason": "Unused upstream linker metadata: this exact image loads only absolute Apple OS libraries; its RPATH is never consulted. No binary/signature modification."
         }
       ],
@@ -43,7 +45,27 @@
         "url": "https://github.com/astral-sh/uv/releases/download/0.9.26/uv-aarch64-apple-darwin.tar.gz",
         "sha256": "fcf0a9ea6599c6ae28a4c854ac6da76f2c889354d7c36ce136ef071f7ab9721f",
         "executable": "uv-aarch64-apple-darwin/uv"
+      },
+      "browserEngine": {
+        "chromium": {
+          "kind": "chrome-headless-shell",
+          "revision": "1234",
+          "browserVersion": "151.0.7922.34",
+          "url": "https://cdn.playwright.dev/builds/cft/151.0.7922.34/mac-arm64/chrome-headless-shell-mac-arm64.zip",
+          "sha256": "cb46a336dbe3d6f1339c5039c3083e4e5dd8e4379710790e34f8f4a865e2452d",
+          "archiveRoot": "chrome-headless-shell-mac-arm64",
+          "directory": "chromium-1234",
+          "executable": "chromium-1234/chrome-headless-shell-mac-arm64/chrome-headless-shell",
+          "license": "licenses/chromium-headless-shell.LICENSE"
+        }
       }
+    }
+  },
+  "engines": {
+    "scrapling": {
+      "version": "0.4.15",
+      "requirements": "requirements-scrapling.txt",
+      "requirementsSha256": "768106b78901fb7ac8ac84d538afcffe910c40264960dd131ec451cfbe595792"
     }
   }
 }

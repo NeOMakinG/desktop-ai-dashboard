@@ -1,6 +1,6 @@
 export type BrowserService = 'home' | 'gmail' | 'google_calendar' | 'custom';
 export type BrowserPhase = 'closed' | 'opening' | 'open' | 'error' | 'unavailable';
-export type BrowserEngine = 'webkit' | 'chromium';
+export type BrowserEngine = 'webkit' | 'chromium' | 'scrapling';
 export interface AvailableBrowserEngine { id: BrowserEngine; label: string }
 
 export function browserActionFailure(status: OwnedBrowserStatus): string | null {
@@ -27,6 +27,17 @@ export interface OwnedBrowserStatus {
   service: BrowserService | null;
   error: string | null;
   automationReady: boolean;
+  /** False only for Scrapling snapshot sessions: fetched pages render read-only. */
+  interactive: boolean;
+  /** True while the Scrapling engine is fetching the next snapshot. */
+  navigating: boolean;
+}
+
+/** The engine `browser_open` uses when the caller omits one: the first host
+ * advertised engine (Scrapling when its sealed resources verify, else WebKit). */
+export function defaultBrowserEngine(engines: AvailableBrowserEngine[]): BrowserEngine | 'unavailable' {
+  const id = engines[0]?.id;
+  return id ?? 'unavailable';
 }
 
 export type ConnectorProvider = 'google';

@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { ArrowLeft, ArrowRight, ArrowSquareOut, Browser, CalendarBlank, EnvelopeSimple, Globe, LockSimple, X } from '@phosphor-icons/react';
 import { IconButton, InlineError } from './components';
-import type { BrowserEngine, BrowserService } from './browser-contracts';
+import { defaultBrowserEngine, type BrowserEngine, type BrowserService } from './browser-contracts';
 import type { OwnedBrowser } from './owned-browser';
 import './browser.css';
 
@@ -52,24 +52,31 @@ export function BrowserView({ browser }: { browser: OwnedBrowser }) {
   const enabled = browser.native && browser.status.available && !browser.busy;
   useEffect(() => { if (!editing.current) setAddress(browser.status.url || ''); }, [browser.status.url]);
 
-  // Engine toggle. Only rendered when the host actually advertises both
-  // engines — Chromium alone is not enough to show a toggle (there's nothing
-  // to toggle to). Default is always WebKit to match the backend default.
+  // Engine toggle. Only rendered when the host actually advertises more than
+  // one engine — a single engine has nothing to toggle to. The default choice
+  // is the host's advertised default (Scrapling first when its sealed
+  // resources verify; WebKit otherwise) — never a silent swap.
   const engines = useMemo(() => browser.status.availableEngines ?? [], [browser.status.availableEngines]);
-  const hasWebkit = engines.some(engine => engine.id === 'webkit');
-  const chromium = engines.find(engine => engine.id === 'chromium');
-  const showToggle = hasWebkit && !!chromium;
-  const [engineChoice, setEngineChoice] = useState<BrowserEngine>('webkit');
+  const hostDefault = useMemo(() => defaultBrowserEngine(engines), [engines]);
+  const scrapling = engines.find(engine => engine.id === 'scrapling');
+  const webkit = engines.find(engine => engine.id === 'webkit');
+  const showToggle = !!webkit && !!scrapling;
+  const [engineChoice, setEngineChoice] = useState<BrowserEngine>(hostDefault === 'scrapling' ? 'scrapling' : 'webkit');
   useEffect(() => {
-    // If the host stops advertising the chosen engine, fall back to WebKit
-    // rather than leaving the toggle pointed at something unavailable.
-    if (engineChoice === 'chromium' && !chromium) setEngineChoice('webkit');
-  }, [chromium, engineChoice]);
+    // If the host stops advertising the chosen engine, fall back to the
+    // advertised default rather than leaving the toggle on something gone.
+    if (!engines.some(engine => engine.id === engineChoice)) {
+      setEngineChoice(hostDefault === 'scrapling' ? 'scrapling' : 'webkit');
+    }
+  }, [engines, hostDefault, engineChoice]);
 
   const openWithEngine = async (service: BrowserService, url?: string) => {
     if (!enabled) return;
-    await browser.open(service, url, engineChoice);
+    await browser.open(service, url, engines.some(engine => engine.id === engineChoice) ? engineChoice : undefined);
   };
+  // Scrapling sessions render fetched snapshots in the browser window: honest
+  // read-only and fetching states, never a pretend-live page.
+  const scraplingOpen = browser.status.engine === 'scrapling' && open;
 
   return <section className="browser-page" aria-labelledby="browser-title">
     <header className="browser-heading">
@@ -95,14 +102,16 @@ export function BrowserView({ browser }: { browser: OwnedBrowser }) {
       <button type="submit" className="button secondary" disabled={!enabled || !address.trim()}>Go</button>
     </form>
     {browser.error && <InlineError>{browser.error}</InlineError>}
+    {browser.status.navigating && open && <p className="field-note" role="status">Fetching the page through the Scrapling engine…</p>}
+    {scraplingOpen && <p className="field-note">Read-only snapshots: pages are fetched by Scrapling's engine and shown without live scripts. Typing and signing in inside this window are not supported yet.</p>}
     <div className="browser-home-card">
       <div className="browser-window-preview" aria-hidden="true"><div className="browser-preview-chrome"><i /><i /><i /><span /></div><div className="browser-preview-content"><Browser size={44} weight="light" /><span>Your own browsing space</span></div></div>
       <div className="browser-home-copy"><h2>{open ? 'Your browser is open' : 'Sign in once. Keep your sessions.'}</h2>
         <p>{open ? 'Continue in the Forma browser window, or open another service below.' : 'Forma uses its own browser profile. It does not copy the sessions from your normal browser.'}</p>
-        {showToggle && chromium && (
+        {showToggle && scrapling && (
           <div className="browser-engine-toggle" role="radiogroup" aria-label="Browser engine">
+            <button type="button" role="radio" aria-checked={engineChoice === 'scrapling'} className={`browser-engine-option${engineChoice === 'scrapling' ? ' selected' : ''}`} onClick={() => setEngineChoice('scrapling')} disabled={!enabled || open}>Scrapling</button>
             <button type="button" role="radio" aria-checked={engineChoice === 'webkit'} className={`browser-engine-option${engineChoice === 'webkit' ? ' selected' : ''}`} onClick={() => setEngineChoice('webkit')} disabled={!enabled || open}>WebKit</button>
-            <button type="button" role="radio" aria-checked={engineChoice === 'chromium'} className={`browser-engine-option${engineChoice === 'chromium' ? ' selected' : ''}`} onClick={() => setEngineChoice('chromium')} disabled={!enabled || open}>{chromium.label}</button>
           </div>
         )}
         <button type="button" className="button primary" disabled={!enabled} onClick={() => { void openWithEngine('home'); }}>{browser.busy ? 'Opening…' : open ? 'Show browser' : 'Open browser'} <ArrowSquareOut size={17} /></button>

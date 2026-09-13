@@ -50,12 +50,12 @@ function copyController(destination, expected) {
   assert.equal(treeHash(controllerSource, true), expected, 'Controller source changed during preparation');
 }
 
-function publish(stage, work) {
-  fs.mkdirSync(path.dirname(output), { recursive: true });
+function publish(stage, work, destination = output) {
+  fs.mkdirSync(path.dirname(destination), { recursive: true });
   const old = path.join(work, 'previous-bundle');
-  if (fs.existsSync(output)) fs.renameSync(output, old);
-  try { fs.renameSync(stage, output); }
-  catch (error) { if (fs.existsSync(old)) fs.renameSync(old, output); throw error; }
+  if (fs.existsSync(destination)) fs.renameSync(destination, old);
+  try { fs.renameSync(stage, destination); }
+  catch (error) { if (fs.existsSync(old)) fs.renameSync(old, destination); throw error; }
 }
 
 function seal(root, fingerprint) {
@@ -173,6 +173,68 @@ function verify(root, expectedInputs = inputHash()) {
   return manifest;
 }
 
+// The Scrapling engine's Chromium (headless shell) lives in its own sealed
+// resource root so the Hermes core manifest, Mach-O walk, and controller
+// refresh semantics stay untouched. The tree is symlink-free by choice of
+// the headless-shell build; any symlink fails verification.
+const browsersOutput = path.join(repo, 'src-tauri/resources/managed-browsers');
+
+function verifyBrowsers(root = browsersOutput, fingerprint = treeHash(here)) {
+  assert(fs.lstatSync(root).isDirectory() && !fs.lstatSync(root).isSymbolicLink(), 'Browsers resource root must be an owned directory');
+  const chromium = target.browserEngine.chromium;
+  const manifest = JSON.parse(fs.readFileSync(path.join(root, 'manifest.json'), 'utf8'));
+  assert.equal(manifest.schemaVersion, 1);
+  assert.equal(manifest.platform, platform);
+  assert.equal(manifest.kind, 'chromium-headless-shell');
+  assert.equal(manifest.inputSha256, fingerprint, 'Managed browsers are stale; run pnpm runtime:prepare');
+  assert.equal(manifest.chromium.revision, chromium.revision);
+  assert.equal(manifest.chromium.browserVersion, chromium.browserVersion);
+  assert.equal(manifest.chromium.executable, chromium.executable);
+  const checksums = JSON.parse(fs.readFileSync(path.join(root, 'checksums.json'), 'utf8'));
+  const actual = files(root).map(file => path.relative(root, file).split(path.sep).join('/')).filter(file => file !== 'checksums.json').sort();
+  assert.deepEqual(actual, Object.keys(checksums).sort(), 'Missing or unexpected managed browser files');
+  for (const [relative, expected] of Object.entries(checksums)) {
+    assert.match(expected, /^[0-9a-f]{64}$/);
+    assert.equal(hashFile(resolveInside(root, relative)), expected, `Managed browser checksum mismatch: ${relative}`);
+  }
+  assert(fs.statSync(resolveInside(root, chromium.executable)).mode & 0o111, 'Managed Chromium is not executable');
+  return manifest;
+}
+
+function ensureBrowsers() {
+  if (fs.existsSync(path.join(browsersOutput, 'manifest.json'))) {
+    try {
+      verifyBrowsers();
+      console.log('Managed browsers already verified; no network/download.');
+      return;
+    } catch { /* rebuild below */ }
+  }
+  guard();
+  const chromium = target.browserEngine.chromium;
+  const work = fs.mkdtempSync(path.join(cache, 'browsers-'));
+  const stage = path.join(work, 'bundle');
+  try {
+    const archive = download(chromium, `chromium-${chromium.revision}.zip`);
+    fs.mkdirSync(path.join(stage, chromium.directory), { recursive: true });
+    extract(archive, path.join(stage, chromium.directory));
+    const unpacked = path.join(stage, chromium.directory, chromium.archiveRoot);
+    assert(fs.existsSync(path.join(unpacked, 'chrome-headless-shell')), 'Headless shell missing from pinned archive');
+    fs.mkdirSync(path.join(stage, 'licenses'));
+    fs.copyFileSync(path.join(unpacked, 'LICENSE.headless_shell'), path.join(stage, chromium.license));
+    json(path.join(stage, 'manifest.json'), { schemaVersion: 1, platform, kind: 'chromium-headless-shell',
+      inputSha256: treeHash(here), archiveSha256: chromium.sha256,
+      chromium: { revision: chromium.revision, browserVersion: chromium.browserVersion, executable: chromium.executable } });
+    json(path.join(stage, 'checksums.json'), Object.fromEntries(files(stage)
+      .filter(file => path.relative(stage, file) !== 'checksums.json')
+      .map(file => [path.relative(stage, file).split(path.sep).join('/'), hashFile(file)])));
+    verifyBrowsers(stage);
+    publish(stage, work, browsersOutput);
+    console.log(`Managed browsers ${chromium.browserVersion} prepared at ${browsersOutput}`);
+  } finally {
+    fs.rmSync(work, { recursive: true, force: true });
+  }
+}
+
 function refreshController(previous, fingerprint, controllerFingerprint) {
   guard();
   const work = fs.mkdtempSync(path.join(cache, 'refresh-'));
@@ -196,6 +258,7 @@ function prepare() {
   const sdkFingerprint = treeHash(here);
   const controllerFingerprint = treeHash(controllerSource, true);
   const fingerprint = sha(`${sdkFingerprint}:${controllerFingerprint}`);
+  ensureBrowsers();
   if (fs.existsSync(path.join(output, 'manifest.json'))) {
     const previous = JSON.parse(fs.readFileSync(path.join(output, 'manifest.json'), 'utf8'));
     if (previous.inputSha256 === fingerprint && previous.platform === platform && !process.argv.includes('--refresh-controller')) {
@@ -237,8 +300,20 @@ function prepare() {
       '--index-url', 'https://pypi.org/simple', '--dest', wheels, '-r', requirements]);
     run(interpreter, [...pip, 'install', '--no-index', '--find-links', wheels, '--only-binary=:all:',
       '--require-hashes', '--no-deps', '--no-compile', '-r', requirements]);
+    // The Scrapling browser engine rides the same pinned interpreter and the
+    // same offline wheel discipline as the Hermes core set.
+    const scraplingRequirements = path.join(here, pins.engines.scrapling.requirements);
+    assert.equal(sha(fs.readFileSync(scraplingRequirements)), pins.engines.scrapling.requirementsSha256,
+      'Scrapling requirements drifted from pins.json; re-pin consciously');
+    const scraplingWheels = path.join(cache, 'wheels-scrapling');
+    run(interpreter, [...pip, 'download', '--only-binary=:all:', '--require-hashes', '--no-deps',
+      '--index-url', 'https://pypi.org/simple', '--dest', scraplingWheels, '-r', scraplingRequirements]);
+    run(interpreter, [...pip, 'install', '--no-index', '--find-links', scraplingWheels, '--only-binary=:all:',
+      '--require-hashes', '--no-deps', '--no-compile', '-r', scraplingRequirements]);
     run(interpreter, [...pip, 'check']);
     json(path.join(stage, 'wheel-checksums.json'), Object.fromEntries(files(wheels).filter(file => file.endsWith('.whl'))
+      .map(file => [path.basename(file), hashFile(file)])));
+    json(path.join(stage, 'wheel-checksums-scrapling.json'), Object.fromEntries(files(scraplingWheels).filter(file => file.endsWith('.whl'))
       .map(file => [path.basename(file), hashFile(file)])));
     // macOS bsdtar delegates zstd to PATH. Use a hash-pinned build-only wheel
     // instead; neither Homebrew nor the decoder becomes a runtime dependency.
@@ -284,9 +359,10 @@ try {
   assert(!requested || requested === target.target, `Cross-target bundle unavailable: ${requested}`);
   if (process.argv.includes('--verify')) {
     verify(output);
+    verifyBrowsers();
     console.log('Managed Hermes resource inventory verified (offline).');
   } else {
-    for (const dir of ['downloads', 'tmp', 'build-home', 'wheels']) fs.mkdirSync(path.join(cache, dir), { recursive: true });
+    for (const dir of ['downloads', 'tmp', 'build-home', 'wheels', 'wheels-scrapling']) fs.mkdirSync(path.join(cache, dir), { recursive: true });
     const lock = path.join(cache, 'prepare.lock');
     let handle;
     try { handle = fs.openSync(lock, 'wx', 0o600); }

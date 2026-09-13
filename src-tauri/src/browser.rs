@@ -5,6 +5,7 @@
 //! post-launch CDP filters cannot prove startup/restoration/background denial.
 
 mod chromium;
+pub(crate) mod engine;
 #[cfg(target_os = "macos")]
 mod macos;
 mod profile;
@@ -17,6 +18,9 @@ use std::{
     sync::{Arc, Mutex},
 };
 use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow};
+
+pub const ENGINE_SCRAPLING: &str = "scrapling";
+const ENGINE_NAVIGATE_FAILED: &str = "The page could not be fetched by the Scrapling engine.";
 
 pub const LABEL: &str = "owned-browser";
 const MAX_URL_BYTES: usize = 4096;
@@ -31,6 +35,7 @@ pub(super) const GATE_ERROR: &str =
 pub enum BrowserEngine {
     Webkit,
     Chromium,
+    Scrapling,
 }
 
 /// Detected engine, exposed to the frontend so it can render a *truthful*
@@ -47,8 +52,18 @@ pub struct AvailableEngine {
 ///
 /// Never spawns anything or inspects Chromium installations/profiles. Windows
 /// and Linux remain unavailable rather than advertising an unsupported runtime.
-pub fn browser_engines() -> Vec<AvailableEngine> {
+pub fn browser_engines(app: Option<&AppHandle>) -> Vec<AvailableEngine> {
     let mut engines: Vec<AvailableEngine> = Vec::new();
+    // Founder directive 2026-09-13: the integrated browser is Scrapling. It is
+    // advertised first (and used as the default) only when the sealed managed
+    // browser resource is present; otherwise WebKit remains, visibly.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if app.is_some_and(engine::advertised) {
+        engines.push(AvailableEngine {
+            id: ENGINE_SCRAPLING,
+            label: "Scrapling (Chromium snapshots)",
+        });
+    }
     #[cfg(target_os = "macos")]
     if macos::supported() {
         engines.push(AvailableEngine {
@@ -96,6 +111,11 @@ pub struct OwnedBrowserStatus {
     service: Option<BrowserService>,
     error: Option<&'static str>,
     automation_ready: bool,
+    /// False for Scrapling snapshot sessions: the window shows fetched,
+    /// read-only pages; typing and sign-in are not wired to the engine.
+    interactive: bool,
+    /// True while the Scrapling engine is fetching a page in the background.
+    navigating: bool,
 }
 
 pub(super) struct Session {
@@ -110,20 +130,17 @@ pub struct BrowserState {
     directory: Option<PathBuf>,
     app: Option<AppHandle>,
     allow_loopback: bool,
+    engine: Arc<Mutex<Option<engine::EngineRuntime>>>,
+    pub(crate) snapshots: engine::SharedSnapshots,
 }
 
 impl BrowserState {
-    pub fn new(directory: Option<PathBuf>, qa_override: bool) -> Self {
-        let engines = browser_engines();
+    pub fn new(directory: Option<PathBuf>, qa_override: bool, app: Option<&AppHandle>) -> Self {
+        let engines = browser_engines(app);
         let available = !engines.is_empty();
         // Default engine identifier when nothing is running yet — matches the
         // engine `browser_open` will pick when the caller omits `engine`.
-        let default_engine: &'static str = engines
-            .iter()
-            .find(|e| e.id == "webkit")
-            .or_else(|| engines.first())
-            .map(|e| e.id)
-            .unwrap_or("unavailable");
+        let default_engine: &'static str = engines.first().map(|e| e.id).unwrap_or("unavailable");
         Self {
             inner: Arc::new(Mutex::new(Session {
                 status: OwnedBrowserStatus {
@@ -143,19 +160,35 @@ impl BrowserState {
                     service: None,
                     error: if available { None } else { Some(UNAVAILABLE) },
                     automation_ready: false,
+                    interactive: false,
+                    navigating: false,
                 },
                 generation: 0,
                 secured: false,
             })),
             directory,
-            app: None,
+            app: app.cloned(),
             allow_loopback: cfg!(debug_assertions) && qa_override,
+            engine: Arc::new(Mutex::new(None)),
+            snapshots: Arc::new(Mutex::new(engine::SnapshotStore::default())),
         }
     }
 
     pub fn with_app(mut self, app: AppHandle) -> Self {
         self.app = Some(app);
         self
+    }
+
+    /// Engine and relay teardown is bounded; snapshots die with the session.
+    pub async fn stop_engine(&self) {
+        let runtime = self.engine.lock().ok().and_then(|mut slot| slot.take());
+        if let Some(runtime) = runtime {
+            runtime.controller.shutdown().await;
+            runtime.relay.stop();
+        }
+        if let Ok(mut store) = self.snapshots.lock() {
+            store.end();
+        }
     }
 
     fn emit(&self) {
@@ -194,6 +227,7 @@ impl BrowserState {
                 session.status.phase = BrowserPhase::Error;
                 session.status.error = Some(GATE_ERROR);
                 session.status.url = None;
+                session.status.navigating = false;
             }
         }
         self.emit();
@@ -207,6 +241,7 @@ impl BrowserState {
                 s.status.phase = BrowserPhase::Error;
                 s.status.error = Some(GATE_ERROR);
                 s.status.url = None;
+                s.status.navigating = false;
             }
         }
         self.emit();
@@ -231,16 +266,74 @@ impl BrowserState {
     fn permits(&self, generation: u64, url: &Url) -> bool {
         // Do not nest the browser and connector mutexes. The callback listener
         // independently validates state/expiry again before accepting a response.
-        let allowed = url.as_str() == "about:blank" || self.validate_url(url.as_str()).is_ok();
+        if url.as_str() == "about:blank" {
+            return self
+                .lock()
+                .map(|s| s.generation == generation)
+                .unwrap_or(false);
+        }
+        if url.scheme() == engine::SNAPSHOT_SCHEME {
+            return self.permits_snapshot(generation, url);
+        }
+        let session = self
+            .lock()
+            .map(|s| (s.generation == generation && s.secured, s.status.engine))
+            .unwrap_or((false, "unavailable"));
+        if session.1 == ENGINE_SCRAPLING {
+            // Snapshot link clicks never load directly: they are routed back
+            // through the Scrapling engine and re-rendered as a new snapshot.
+            if session.0 && matches!(url.scheme(), "https" | "http") {
+                if let Ok(target) = self.validate_url(url.as_str()) {
+                    if let Some(app) = self.app.clone() {
+                        let state = self.clone();
+                        tauri::async_runtime::spawn(async move {
+                            engine_navigate(&app, &state, target).await;
+                        });
+                    }
+                }
+            }
+            return false;
+        }
+        let allowed = self.validate_url(url.as_str()).is_ok();
         self.lock()
-            .map(|s| {
-                s.generation == generation
-                    && (url.as_str() == "about:blank" || (s.secured && allowed))
-            })
+            .map(|s| s.generation == generation && (s.secured && allowed))
             .unwrap_or(false)
     }
 
+    fn permits_snapshot(&self, generation: u64, url: &Url) -> bool {
+        let engine_live = self
+            .lock()
+            .map(|s| s.generation == generation && s.secured && s.status.engine == ENGINE_SCRAPLING)
+            .unwrap_or(false);
+        if !engine_live {
+            return false;
+        }
+        let Some(session) = url.host_str() else {
+            return false;
+        };
+        let path = url.path().trim_start_matches('/');
+        if path.contains('/') || path.is_empty() {
+            return false;
+        }
+        let store = self.snapshots.lock();
+        let Ok(store) = store else { return false };
+        store.session.map(|id| id.to_string()).as_deref() == Some(session)
+            && (path == "home" || store.find(path).is_some())
+    }
+
     fn closed(&self, generation: u64, preserve_error: bool) {
+        let engine_was_live = self
+            .lock()
+            .map(|s| {
+                s.generation == generation
+                    && s.status.engine == ENGINE_SCRAPLING
+                    && self
+                        .engine
+                        .lock()
+                        .map(|slot| slot.is_some())
+                        .unwrap_or(false)
+            })
+            .unwrap_or(false);
         if let Ok(mut s) = self.lock() {
             if s.generation == generation {
                 s.generation = s.generation.wrapping_add(1);
@@ -251,7 +344,14 @@ impl BrowserState {
                 }
                 s.status.url = None;
                 s.status.service = None;
+                s.status.navigating = false;
             }
+        }
+        if engine_was_live {
+            let state = self.clone();
+            tauri::async_runtime::spawn(async move {
+                state.stop_engine().await;
+            });
         }
         self.emit();
     }
@@ -354,7 +454,7 @@ fn content_rules() -> String {
     .to_string()
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 pub(super) enum History {
     Back,
     Forward,
@@ -370,24 +470,251 @@ enum Action {
 }
 
 /// Resolve the engine requested by the caller against what the host actually
-/// supports. **Default remains WebKit** — if the caller omits `engine`, we
-/// always attempt WebKit and fail closed when it is not available (never
-/// silently swap to Chromium). Explicit Chromium requests remain unavailable.
-fn resolve_engine(request: Option<BrowserEngine>) -> AppResult<BrowserEngine> {
-    let want = request.unwrap_or(BrowserEngine::Webkit);
+/// supports. The default is the first advertised engine — Scrapling when its
+/// sealed resources verify (founder directive 2026-09-13), WebKit otherwise.
+/// The fallback is visible in the engine list, never a silent swap; explicit
+/// Chromium requests remain unavailable.
+fn resolve_engine(
+    request: Option<BrowserEngine>,
+    advertised: &[AvailableEngine],
+) -> AppResult<BrowserEngine> {
+    let engines = advertised;
+    let default = match engines.first() {
+        Some(engine) if engine.id == ENGINE_SCRAPLING => BrowserEngine::Scrapling,
+        _ => BrowserEngine::Webkit,
+    };
+    let want = request.unwrap_or(default);
     if want == BrowserEngine::Chromium {
         chromium::require_available()?;
     }
-    let engines = browser_engines();
     let wanted_id = match want {
         BrowserEngine::Webkit => "webkit",
         BrowserEngine::Chromium => "chromium",
+        BrowserEngine::Scrapling => ENGINE_SCRAPLING,
     };
     if engines.iter().any(|e| e.id == wanted_id) {
         Ok(want)
     } else {
         Err(AppError::new("browser_unavailable", GATE_ERROR))
     }
+}
+
+async fn start_engine(app: &AppHandle, state: &BrowserState) -> AppResult<()> {
+    if !cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        return Err(AppError::new(
+            "browser_unavailable",
+            "The Scrapling engine is not packaged for this platform.",
+        ));
+    }
+    let root = engine::browsers_root(app)?;
+    let executable = tokio::task::spawn_blocking(move || engine::verify_browsers(&root))
+        .await
+        .map_err(|_| AppError::new("browser_unavailable", GATE_ERROR))??;
+    let profile = state
+        .directory
+        .as_ref()
+        .ok_or_else(|| AppError::new("browser_profile_unavailable", GATE_ERROR))?
+        .join("managed-browser-engine");
+    std::fs::create_dir_all(&profile).map_err(|_| AppError::storage())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&profile, std::fs::Permissions::from_mode(0o700))
+            .map_err(|_| AppError::storage())?;
+    }
+    let relay = engine::spawn_relay(state.allow_loopback).await?;
+    let fixture_root = state
+        .allow_loopback
+        .then(|| std::env::var_os("FORMA_ENGINE_FIXTURE_ROOT").map(PathBuf::from))
+        .flatten();
+    let runtime =
+        engine::launch_engine(app, executable, profile, &relay, fixture_root.as_deref()).await?;
+    state
+        .engine
+        .lock()
+        .map_err(|_| AppError::new("browser_unavailable", GATE_ERROR))?
+        .replace(runtime);
+    Ok(())
+}
+
+/// Fetch `url` through the engine and re-render the window from the snapshot.
+/// Failures leave the previous snapshot visible with an honest status error.
+async fn engine_navigate(app: &AppHandle, state: &BrowserState, url: Url) {
+    let generation = state.lock().map(|s| s.generation).unwrap_or(u64::MAX);
+    {
+        let Ok(mut s) = state.lock() else { return };
+        if s.generation != generation || s.status.engine != ENGINE_SCRAPLING {
+            return;
+        }
+        s.status.navigating = true;
+        s.status.error = None;
+    }
+    state.emit();
+    let controller = state
+        .engine
+        .lock()
+        .ok()
+        .and_then(|slot| slot.as_ref().map(|runtime| runtime.controller.clone()));
+    let outcome = match controller {
+        Some(controller) => {
+            controller
+                .control(serde_json::json!({"op": "navigate", "url": url.as_str()}))
+                .await
+        }
+        None => Err(AppError::new(
+            "browser_engine_failed",
+            ENGINE_NAVIGATE_FAILED,
+        )),
+    };
+    let applied = match outcome {
+        Ok(value) => {
+            let final_url = value["url"]
+                .as_str()
+                .and_then(|text| Url::parse(text).ok())
+                .unwrap_or_else(|| url.clone());
+            let truncated = value["truncated"] == true;
+            let shaped = engine::shape_snapshot(
+                &final_url,
+                value["html"].as_str().unwrap_or_default(),
+                truncated,
+            );
+            let stored = state
+                .snapshots
+                .lock()
+                .ok()
+                .and_then(|mut store| Some(store.insert(final_url.clone(), shaped)));
+            stored
+                .zip(
+                    state
+                        .snapshots
+                        .lock()
+                        .ok()
+                        .and_then(|store| store.session.map(|id| id.to_string())),
+                )
+                .and_then(|(id, session)| {
+                    Url::parse(&format!("{}://{}/{}", engine::SNAPSHOT_SCHEME, session, id)).ok()
+                })
+                .and_then(|target| {
+                    let window = app.get_webview_window(LABEL)?;
+                    window.navigate(target).ok()?;
+                    Some(final_url)
+                })
+        }
+        Err(_) => None,
+    };
+    if let Ok(mut s) = state.lock() {
+        if s.generation == generation {
+            s.status.navigating = false;
+            match applied {
+                Some(final_url) => {
+                    s.status.url = public_url(&final_url);
+                    s.status.service = Some(BrowserService::Custom);
+                }
+                None => s.status.error = Some(ENGINE_NAVIGATE_FAILED),
+            }
+        }
+    }
+    state.emit();
+}
+
+async fn open_scrapling(
+    app: AppHandle,
+    state: BrowserState,
+    service: BrowserService,
+    raw: Option<String>,
+) -> AppResult<OwnedBrowserStatus> {
+    let url = match (service, raw.as_deref()) {
+        (BrowserService::Custom, Some(raw)) => state.validate_url(raw)?,
+        _ => service_url(service, raw.as_deref(), state.allow_loopback)?,
+    };
+    let phase = state.status()?.phase;
+    if phase == BrowserPhase::Opening {
+        return Err(AppError::new(
+            "browser_busy",
+            "The browser is still securing its profile. Try again shortly.",
+        ));
+    }
+    let live = state
+        .lock()
+        .map(|s| s.secured && s.status.engine == ENGINE_SCRAPLING)
+        .unwrap_or(false)
+        && app.get_webview_window(LABEL).is_some();
+    if live {
+        if service != BrowserService::Home {
+            engine_navigate(&app, &state, url).await;
+        }
+        if let Some(window) = app.get_webview_window(LABEL) {
+            window
+                .show()
+                .and_then(|_| window.set_focus())
+                .map_err(|_| {
+                    AppError::new(
+                        "browser_focus_failed",
+                        "The browser is open, but its window could not be brought forward.",
+                    )
+                })?;
+        }
+        state.emit();
+        return state.status();
+    }
+    let generation = {
+        let mut s = state.lock()?;
+        s.generation = s.generation.wrapping_add(1);
+        s.secured = false;
+        s.status.phase = BrowserPhase::Opening;
+        s.status.error = None;
+        s.status.url = None;
+        s.status.service = Some(service);
+        s.status.engine = ENGINE_SCRAPLING;
+        s.status.navigating = url.as_str() != "about:blank";
+        s.status.interactive = false;
+        s.generation
+    };
+    if let Ok(mut store) = state.snapshots.lock() {
+        store.reset();
+    }
+    let session = state
+        .snapshots
+        .lock()
+        .ok()
+        .and_then(|store| store.session.map(|id| id.to_string()))
+        .ok_or_else(|| AppError::new("browser_unavailable", GATE_ERROR))?;
+    let home = Url::parse(&format!("{}://{}/home", engine::SNAPSHOT_SCHEME, session))
+        .map_err(|_| AppError::new("browser_unavailable", GATE_ERROR))?;
+    let timeout_state = state.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(75)).await;
+        timeout_state.expire(generation);
+    });
+    #[cfg(target_os = "macos")]
+    {
+        if macos::open(&app, &state, generation, home, true).is_err() {
+            state.fail(generation);
+            return state.status();
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        state.fail(generation);
+        return Err(AppError::new("browser_unavailable", UNAVAILABLE));
+    }
+    if let Err(error) = start_engine(&app, &state).await {
+        state.fail(generation);
+        if let Some(window) = app.get_webview_window(LABEL) {
+            let _ = window.destroy();
+        }
+        state.closed(generation, true);
+        return Err(error);
+    }
+    if url.as_str() != "about:blank" {
+        engine_navigate(&app, &state, url).await;
+    } else if let Ok(mut s) = state.lock() {
+        if s.generation == generation && s.status.phase == BrowserPhase::Opening {
+            s.status.navigating = false;
+        }
+    }
+    state.emit();
+    state.status()
 }
 
 async fn perform(
@@ -399,12 +726,56 @@ async fn perform(
     // successful dispatcher enqueue is not proof that navigation was allowed.
     if let Action::History(direction) = &action {
         let window = secured_window(&app, &state)?;
+        // Reload re-fetches through the engine: a stored snapshot is never
+        // silently re-served as if it were fresh.
+        if *direction == History::Reload
+            && state
+                .lock()
+                .map(|s| s.status.engine == ENGINE_SCRAPLING && s.secured)
+                .unwrap_or(false)
+        {
+            let target = window
+                .url()
+                .ok()
+                .and_then(|url| Url::parse(url.as_str()).ok());
+            let snapshot = target
+                .as_ref()
+                .filter(|url| url.scheme() == engine::SNAPSHOT_SCHEME)
+                .and_then(|url| {
+                    let id = url.path().trim_start_matches('/');
+                    state
+                        .snapshots
+                        .lock()
+                        .ok()
+                        .and_then(|store| store.find(id).cloned())
+                });
+            if let Some(snapshot) = snapshot {
+                engine_navigate(&app, &state, snapshot.url).await;
+                state.emit();
+                return state.status();
+            }
+        }
         #[cfg(target_os = "macos")]
         macos::history(&window, state.clone(), *direction).await?;
         #[cfg(not(target_os = "macos"))]
         return Err(AppError::new("browser_unavailable", UNAVAILABLE));
         state.emit();
         return state.status();
+    }
+    if let Action::Open(service, raw, BrowserEngine::Scrapling) = &action {
+        return open_scrapling(app.clone(), state.clone(), *service, raw.clone()).await;
+    }
+    if let Action::Navigate(raw) = &action {
+        if state
+            .lock()
+            .map(|s| s.status.engine == ENGINE_SCRAPLING && s.secured)
+            .unwrap_or(false)
+        {
+            let url = state.validate_url(raw)?;
+            engine_navigate(&app, &state, url).await;
+            state.emit();
+            return state.status();
+        }
     }
     let (tx, rx) = tokio::sync::oneshot::channel();
     let handle = app.clone();
@@ -433,10 +804,13 @@ fn perform_on_main(
     match action {
         Action::Status => {
             if state.lock()?.secured {
+                let engine_session = state.lock()?.status.engine.eq(ENGINE_SCRAPLING);
                 if let Some(window) = app.get_webview_window(LABEL) {
-                    // url() is native and handles same-document/history URL changes, too.
-                    let url = window.url().ok().and_then(|u| public_url(&u));
-                    state.lock()?.status.url = url;
+                    if !engine_session {
+                        // url() is native and handles same-document/history URL changes, too.
+                        let url = window.url().ok().and_then(|u| public_url(&u));
+                        state.lock()?.status.url = url;
+                    }
                 } else {
                     let generation = state.lock()?.generation;
                     state.closed(generation, false);
@@ -500,7 +874,7 @@ fn perform_on_main(
                             s.generation
                         };
                         #[cfg(target_os = "macos")]
-                        if macos::open(app, state, generation, url).is_err() {
+                        if macos::open(app, state, generation, url, false).is_err() {
                             state.fail(generation);
                         }
                         // A completion that never arrives cannot leave an indefinitely 'opening' view.
@@ -513,6 +887,11 @@ fn perform_on_main(
                 }
                 BrowserEngine::Chromium => {
                     open_chromium(state, service, url)?;
+                }
+                BrowserEngine::Scrapling => {
+                    // Handled asynchronously in `perform`; the main thread
+                    // never blocks on engine startup or page fetches.
+                    return Err(AppError::new("browser_unavailable", GATE_ERROR));
                 }
             }
         }
@@ -579,7 +958,11 @@ pub async fn browser_open(
     engine: Option<BrowserEngine>,
 ) -> AppResult<OwnedBrowserStatus> {
     crate::first_party(&window)?;
-    let engine = resolve_engine(engine)?;
+    let advertised = state
+        .lock()
+        .map(|s| s.status.available_engines.clone())
+        .unwrap_or_default();
+    let engine = resolve_engine(engine, &advertised)?;
     perform(
         app,
         state.inner().clone(),
@@ -645,7 +1028,7 @@ mod tests {
 
     #[test]
     fn status_snapshots_have_monotonic_revisions() {
-        let state = BrowserState::new(None, false);
+        let state = BrowserState::new(None, false, None);
         let first = state.status().unwrap();
         state.closed(0, false);
         let second = state.status().unwrap();
@@ -682,6 +1065,100 @@ mod tests {
         assert!(validate_url("https://example.com/path?code=private#key", false).is_ok());
     }
     #[test]
+    fn snapshot_navigation_is_session_scoped_and_engine_gated() {
+        let state = BrowserState::new(None, false, None);
+        let session = uuid::Uuid::new_v4();
+        let stored = Url::parse("https://example.com/page").unwrap();
+        {
+            let mut s = state.lock().unwrap();
+            s.secured = true;
+            s.status.engine = ENGINE_SCRAPLING;
+            s.status.phase = BrowserPhase::Open;
+        }
+        // The store lock is never held across navigation-gate decisions.
+        let id = {
+            let mut store = state.snapshots.lock().unwrap();
+            store.session = Some(session);
+            store.insert(stored.clone(), "<html>x</html>".into())
+        };
+        let url_for = |entry: &str| {
+            Url::parse(&format!(
+                "{}://{}/{}",
+                engine::SNAPSHOT_SCHEME,
+                session,
+                entry
+            ))
+            .unwrap()
+        };
+        assert!(state.permits_snapshot(0, &url_for(&id)));
+        assert!(state.permits_snapshot(0, &url_for("home")));
+        // Unknown snapshot, foreign session, nested paths, and unsecured
+        // sessions never load anything.
+        assert!(!state.permits_snapshot(0, &url_for("missing")));
+        assert!(!state.permits_snapshot(
+            0,
+            &Url::parse(&format!(
+                "{}://{}/{}",
+                engine::SNAPSHOT_SCHEME,
+                uuid::Uuid::new_v4(),
+                id
+            ))
+            .unwrap()
+        ));
+        assert!(!state.permits_snapshot(0, &url_for("a/b")));
+        // A stale generation is never permitted, even mid-session.
+        assert!(!state.permits(999, &url_for("home")));
+        // A secured engine session denies direct loads of external URLs (they
+        // are re-fetched through the engine instead) and allows snapshots.
+        {
+            let mut s = state.lock().unwrap();
+            s.secured = true;
+            s.status.engine = ENGINE_SCRAPLING;
+            s.status.phase = BrowserPhase::Open;
+        }
+        assert!(!state.permits(0, &Url::parse("https://example.com/").unwrap()));
+        assert!(state.permits(
+            0,
+            &Url::parse(&format!("{}://{}/home", engine::SNAPSHOT_SCHEME, session)).unwrap()
+        ));
+        // WebKit sessions keep the classic deny-by-default external policy.
+        {
+            let mut s = state.lock().unwrap();
+            s.status.engine = "webkit";
+        }
+        assert!(state.permits(0, &Url::parse("https://example.com/").unwrap()));
+        assert!(!state.permits(0, &Url::parse("http://127.0.0.1:9200/").unwrap()));
+    }
+
+    #[test]
+    fn scrapling_default_is_first_advertised_engine_only() {
+        let engines = vec![
+            AvailableEngine {
+                id: ENGINE_SCRAPLING,
+                label: "Scrapling (Chromium snapshots)",
+            },
+            AvailableEngine {
+                id: "webkit",
+                label: "WebKit",
+            },
+        ];
+        assert_eq!(
+            resolve_engine(None, &engines).unwrap(),
+            BrowserEngine::Scrapling
+        );
+        assert_eq!(
+            resolve_engine(None, &[engines[1].clone()]).unwrap(),
+            BrowserEngine::Webkit
+        );
+        assert!(resolve_engine(Some(BrowserEngine::Chromium), &engines).is_err());
+        assert!(resolve_engine(Some(BrowserEngine::Scrapling), &[engines[1].clone()]).is_err());
+        assert_eq!(
+            resolve_engine(Some(BrowserEngine::Webkit), &engines).unwrap(),
+            BrowserEngine::Webkit
+        );
+    }
+
+    #[test]
     fn loopback_requires_explicit_qa_mode() {
         for url in [
             "http://localhost:9200/",
@@ -700,7 +1177,7 @@ mod tests {
         let pending = |url: &Url| url.as_str() == callback;
         assert!(validate_url_with_callback(callback, false, pending).is_ok());
         assert!(validate_url_with_callback(callback, false, |_| false).is_err());
-        assert!(BrowserState::new(None, false)
+        assert!(BrowserState::new(None, false, None)
             .validate_url(callback)
             .is_err());
         for raw in [
@@ -734,7 +1211,7 @@ mod tests {
 
     #[test]
     fn chromium_cannot_start_or_mutate_an_existing_session() {
-        let state = BrowserState::new(None, false);
+        let state = BrowserState::new(None, false, None);
         let before = state.status().unwrap();
         let error = open_chromium(
             &state,
@@ -745,9 +1222,15 @@ mod tests {
         assert_eq!(error.code, "browser_unavailable");
         assert_eq!(error.message, chromium::UNAVAILABLE_REASON);
         assert_eq!(
-            resolve_engine(Some(BrowserEngine::Chromium))
-                .unwrap_err()
-                .message,
+            resolve_engine(
+                Some(BrowserEngine::Chromium),
+                &[AvailableEngine {
+                    id: "webkit",
+                    label: "WebKit",
+                }]
+            )
+            .unwrap_err()
+            .message,
             chromium::UNAVAILABLE_REASON
         );
         let after = state.status().unwrap();
@@ -797,7 +1280,7 @@ mod tests {
             .as_deref(),
             Some("https://example.com/")
         );
-        let state = BrowserState::new(None, false);
+        let state = BrowserState::new(None, false, None);
         let json = serde_json::to_value(state.status().unwrap()).unwrap();
         assert_eq!(json["automationReady"], false);
         assert_eq!(json["persistent"], false);
@@ -814,7 +1297,7 @@ mod tests {
     }
     #[test]
     fn timeout_cannot_fail_a_completed_or_newer_generation() {
-        let state = BrowserState::new(None, false);
+        let state = BrowserState::new(None, false, None);
         {
             let mut s = state.lock().unwrap();
             s.generation = 7;
@@ -839,7 +1322,7 @@ mod tests {
     /// macOS 14+ dev host so the frontend defaults to the truthful label.
     #[test]
     fn status_exposes_available_engines_under_camel_case() {
-        let state = BrowserState::new(None, false);
+        let state = BrowserState::new(None, false, None);
         let json = serde_json::to_value(state.status().unwrap()).unwrap();
         let engines = json["availableEngines"].as_array().expect("array present");
         assert!(json.get("available_engines").is_none());
@@ -857,18 +1340,22 @@ mod tests {
     }
 
     /// `resolve_engine(None)` defaults to WebKit when WebKit is available.
-    /// Never silently substitutes Chromium for a missing WebKit — spec
-    /// requires "Default remains webkit".
+    /// The default is the first advertised engine and never silently
+    /// substitutes: a WebKit-only host defaults to WebKit.
     #[test]
-    fn resolve_engine_defaults_to_webkit() {
-        #[cfg(target_os = "macos")]
-        {
-            assert_eq!(resolve_engine(None).unwrap(), BrowserEngine::Webkit);
-            assert_eq!(
-                resolve_engine(Some(BrowserEngine::Webkit)).unwrap(),
-                BrowserEngine::Webkit
-            );
-        }
+    fn resolve_engine_defaults_to_webkit_when_alone() {
+        let webkit_only = [AvailableEngine {
+            id: "webkit",
+            label: "WebKit",
+        }];
+        assert_eq!(
+            resolve_engine(None, &webkit_only).unwrap(),
+            BrowserEngine::Webkit
+        );
+        assert_eq!(
+            resolve_engine(Some(BrowserEngine::Webkit), &webkit_only).unwrap(),
+            BrowserEngine::Webkit
+        );
     }
 
     /// Requesting an engine the host does not have fails closed with the
@@ -879,9 +1366,9 @@ mod tests {
         // Chromium binary is installed under the standard paths, requesting
         // it must return an error. This test is only meaningful when the
         // detection layer reports no chromium engine.
-        let engines = browser_engines();
+        let engines = browser_engines(None);
         if !engines.iter().any(|e| e.id == "chromium") {
-            let err = resolve_engine(Some(BrowserEngine::Chromium)).unwrap_err();
+            let err = resolve_engine(Some(BrowserEngine::Chromium), &engines).unwrap_err();
             assert_eq!(err.code, "browser_unavailable");
         }
     }
@@ -890,7 +1377,7 @@ mod tests {
     /// human label and a snake_case id the frontend can key off.
     #[test]
     fn browser_engines_labels_are_truthful() {
-        for engine in browser_engines() {
+        for engine in browser_engines(None) {
             match engine.id {
                 "webkit" => assert_eq!(engine.label, "WebKit"),
                 "chromium" => assert!(
@@ -907,7 +1394,7 @@ mod tests {
 
     #[test]
     fn closing_cancels_late_initialization_and_preserves_profile_identity() {
-        let state = BrowserState::new(None, false);
+        let state = BrowserState::new(None, false, None);
         {
             let mut s = state.lock().unwrap();
             s.generation = 4;

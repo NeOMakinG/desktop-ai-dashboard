@@ -317,6 +317,51 @@ async fn finish_window_close(
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        // Read-only snapshot surface for Scrapling engine sessions. Strict
+        // CSP: no scripts, no external subresources, no form submission; the
+        // only navigation allowed out of a snapshot is intercepted by the
+        // browser navigation gate and re-fetched through the engine.
+        .register_uri_scheme_protocol(browser::engine::SNAPSHOT_SCHEME, |context, request| {
+            use std::borrow::Cow;
+            const CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; img-src data:; form-action 'none'; base-uri *; frame-ancestors 'none'";
+            let snapshot = context
+                .app_handle()
+                .try_state::<browser::BrowserState>()
+                .and_then(|state| {
+                    let text = request.uri().to_string();
+                    reqwest::Url::parse(&text).ok().and_then(|url| {
+                        let session = url.host_str()?.to_string();
+                        let id = url.path().trim_start_matches('/').to_string();
+                        browser::engine::snapshot_response(&state.snapshots, &session, &id)
+                    })
+                });
+            let (status, html, content_type) = match snapshot {
+                Some((html, content_type)) => (
+                    tauri::http::StatusCode::OK,
+                    html,
+                    content_type,
+                ),
+                None => (
+                    tauri::http::StatusCode::NOT_FOUND,
+                    "<!doctype html><meta charset=\"utf-8\"><p>Snapshot unavailable.</p>".to_string(),
+                    "text/html; charset=utf-8",
+                ),
+            };
+            tauri::http::Response::builder()
+                .status(status)
+                .header("Content-Type", content_type)
+                .header("Cache-Control", "no-store")
+                .header("Referrer-Policy", "no-referrer")
+                .header("X-Content-Type-Options", "nosniff")
+                .header("Content-Security-Policy", CSP)
+                .body(Cow::<'static, [u8]>::Owned(html.into_bytes()))
+                .unwrap_or_else(|_| {
+                    tauri::http::Response::builder()
+                        .status(tauri::http::StatusCode::NOT_FOUND)
+                        .body(Cow::<'static, [u8]>::Borrowed(&[][..]))
+                        .expect("static response")
+                })
+        })
         .plugin(tauri_plugin_single_instance::init(|app, _, _| {
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.show();
@@ -338,6 +383,7 @@ pub fn run() {
                 browser::BrowserState::new(
                     directory.as_ref().ok().cloned(),
                     test_directory.is_some(),
+                    Some(app.handle()),
                 )
                 .with_app(app.handle().clone()),
             );

@@ -21,6 +21,7 @@ pub(super) fn open(
     state: &BrowserState,
     generation: u64,
     target: Url,
+    engine_session: bool,
 ) -> AppResult<()> {
     if !supported() {
         return Err(AppError::new("browser_unavailable", GATE_ERROR));
@@ -50,7 +51,18 @@ pub(super) fn open(
             return;
         }
         // WebKit guarantees the rule's lifetime for this completion; adding it retains it.
-        let result = unsafe { build(&app, &state, generation, id, &*rule, target.clone(), mtm) };
+        let result = unsafe {
+            build(
+                &app,
+                &state,
+                generation,
+                id,
+                &*rule,
+                target.clone(),
+                mtm,
+                engine_session,
+            )
+        };
         if result.is_err() {
             state.fail(generation);
         }
@@ -74,6 +86,7 @@ unsafe fn build(
     rule: &WKContentRuleList,
     target: Url,
     mtm: MainThreadMarker,
+    engine_session: bool,
 ) -> AppResult<()> {
     if !state.current(generation) {
         return Ok(());
@@ -98,7 +111,11 @@ unsafe fn build(
         LABEL,
         WebviewUrl::External(Url::parse("about:blank").map_err(|_| invalid_url())?),
     )
-    .title("Forma — Owned Browser (WebKit)")
+    .title(if engine_session {
+        "Forma — Scrapling Browser (read-only snapshots)"
+    } else {
+        "Forma — Owned Browser (WebKit)"
+    })
     .inner_size(1120.0, 820.0)
     .min_inner_size(640.0, 480.0)
     .visible(false)

@@ -1,6 +1,6 @@
 import { strict as assert } from 'node:assert';
 import { readFileSync } from 'node:fs';
-import { acceptsBrowserRevision, browserActionFailure, type OwnedBrowserStatus } from './browser-contracts.ts';
+import { acceptsBrowserRevision, browserActionFailure, defaultBrowserEngine, type AvailableBrowserEngine, type OwnedBrowserStatus } from './browser-contracts.ts';
 
 export function runBrowserRegressionChecks() {
   assert.equal(acceptsBrowserRevision(-1, 0), true);
@@ -20,7 +20,19 @@ export function runBrowserRegressionChecks() {
     availableEngines: [{ id: 'webkit', label: 'WebKit' }],
     chromiumUnavailableReason: 'Chromium is unavailable until startup protection is proven.',
     persistent: false, profileId: null, url: null, service: null, error: null, automationReady: false,
+    interactive: false, navigating: false,
   };
+  // Scrapling is the advertised default when its sealed engine resources
+  // verify; without them the default stays WebKit — never a silent swap.
+  const enginesWith: AvailableBrowserEngine[] = [
+    { id: 'scrapling', label: 'Scrapling (Chromium snapshots)' },
+    { id: 'webkit', label: 'WebKit' },
+  ];
+  assert.equal(defaultBrowserEngine(enginesWith), 'scrapling');
+  assert.equal(defaultBrowserEngine([{ id: 'webkit', label: 'WebKit' }]), 'webkit');
+  assert.equal(defaultBrowserEngine([]), 'unavailable');
+  assert.equal(browserActionFailure({ ...status, availableEngines: enginesWith, engine: 'scrapling', phase: 'open', interactive: false, navigating: true }), null);
+  assert.equal(browserActionFailure({ ...status, engine: 'scrapling', phase: 'error', error: 'The page could not be fetched by the Scrapling engine.' }), 'The page could not be fetched by the Scrapling engine.');
   assert.equal(browserActionFailure(status), null);
   assert.equal(browserActionFailure({ ...status, phase: 'opening' }), null);
   assert.equal(browserActionFailure({ ...status, phase: 'error', error: 'Native gate failed.' }), 'Native gate failed.');
@@ -42,6 +54,12 @@ export function runBrowserRegressionChecks() {
   assert.match(input, /background\s*:\s*transparent\s*;/);
   const browserView = readFileSync(new URL('./BrowserView.tsx', import.meta.url), 'utf8');
   const websiteActions = browserView.slice(browserView.indexOf('export function BrowserConnections('), browserView.indexOf('export function BrowserView('));
+  const engineStates = browserView.slice(browserView.indexOf('export function BrowserView('));
+  assert.match(engineStates, /defaultBrowserEngine\(engines\)/);
+  assert.match(engineStates, /aria-checked=\{engineChoice === 'scrapling'\}/);
+  assert.match(engineStates, /Fetching the page through the Scrapling engine…/);
+  assert.match(engineStates, /Read-only snapshots: pages are fetched by Scrapling's engine and shown without live scripts\. Typing and signing in inside this window are not supported yet\./);
+  assert.match(engineStates, /browser\.status\.navigating && open/);
   assert.match(websiteActions, /aria-label="Website browsing"/);
   assert.match(websiteActions, /These websites do not give the agent Gmail or Calendar access/);
   assert.match(websiteActions, /onClick=\{\(\) => open\(service\.id\)\}>Open website/);
@@ -63,5 +81,5 @@ export function runBrowserRegressionChecks() {
   assert.match(start, /launch_google_browser\(&core, &id, loopback, &authorize_url, &cancel, opener::spawn\)/);
   assert.match(start, /Ok\(StartResponse \{ attempt_id \}\)/);
   assert.doesNotMatch(start, /(?:println!|dbg!|log::|tracing::)/);
-  return ['browser revisions reject stale and invalid snapshots', 'late open response cannot overwrite a newer close event', 'unavailable and native error snapshots never report action success', 'browser spacing, colors, and composed-input borders follow the design contract', 'Google OAuth uses a native-owned system-browser route with no embedded-browser dependency or renderer authorization URL'];
+  return ['browser revisions reject stale and invalid snapshots', 'late open response cannot overwrite a newer close event', 'unavailable and native error snapshots never report action success', 'browser spacing, colors, and composed-input borders follow the design contract', 'Google OAuth uses a native-owned system-browser route with no embedded-browser dependency or renderer authorization URL', 'scrapling engine default and read-only snapshot states stay explicit and honest'];
 }
