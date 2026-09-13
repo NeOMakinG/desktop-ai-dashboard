@@ -23,6 +23,31 @@ pub(super) fn open(
     target: Url,
     engine_session: bool,
 ) -> AppResult<()> {
+    // Tauri async commands run off the main thread; every WebKit gate below
+    // requires it. Hop once and report failure through the state machine —
+    // the body's early errors already log their gate site.
+    if MainThreadMarker::new().is_none() {
+        let app2 = app.clone();
+        let state2 = state.clone();
+        let dispatched = app.run_on_main_thread(move || {
+            if open_on_main(&app2, &state2, generation, target, engine_session).is_err() {
+                state2.fail(generation);
+            }
+        });
+        return dispatched.map_err(|_| {
+            super::gate(Some(app), "main_dispatch", "browser_main_dispatch_failed")
+        });
+    }
+    open_on_main(app, state, generation, target, engine_session)
+}
+
+fn open_on_main(
+    app: &AppHandle,
+    state: &BrowserState,
+    generation: u64,
+    target: Url,
+    engine_session: bool,
+) -> AppResult<()> {
     if !supported() {
         return Err(super::gate(Some(app), "supported", "browser_unsupported"));
     }
