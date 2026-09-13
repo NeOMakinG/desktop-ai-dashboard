@@ -96,6 +96,7 @@ function ComposioKeyField({ services }: { services: ServicesController }) {
   const [error, setError] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
   const stored = services.snapshot?.keyConfigured ?? false;
+  const relay = services.snapshot?.relay ?? false;
   const trimmed = apiKey.trim();
   const submit = async () => {
     if (busy || !validComposioKey(trimmed)) return;
@@ -111,7 +112,7 @@ function ComposioKeyField({ services }: { services: ServicesController }) {
     catch (failure) { setError(friendlyError(failure)); }
     finally { setBusy(false); }
   };
-  return <form className="composio-key-field" onSubmit={event => { event.preventDefault(); void submit(); }}>
+  const form = <form className="composio-key-field" onSubmit={event => { event.preventDefault(); void submit(); }}>
     <label>Composio API key <span className="optional">{stored ? 'stored securely' : 'for connecting services'}</span>
       <input type="password" value={apiKey} maxLength={4096} autoComplete="off" autoCapitalize="off" spellCheck={false}
         data-1p-ignore="true" data-lpignore="true" disabled={busy}
@@ -125,6 +126,16 @@ function ComposioKeyField({ services }: { services: ServicesController }) {
     {error && <InlineError>{error}</InlineError>}
     <p className="field-note">The key is stored only in your OS keychain — never in chats, logs, or files — and can be removed anytime. Without it, service listing and connecting stay unavailable.</p>
   </form>;
+  if (relay) {
+    return <div className="composio-key-field">
+      <p className="field-note"><CheckCircle size={13} /> Services are provided by Forma — connections work out of the box, no API key needed.</p>
+      <details>
+        <summary className="text-button">Advanced</summary>
+        {form}
+      </details>
+    </div>;
+  }
+  return form;
 }
 
 function ProviderSetup({ store, settings, onBusyChange }: { store: AppStore; settings: AppSettings; onBusyChange?: (busy: boolean) => void }) {

@@ -28,6 +28,36 @@ const UNAVAILABLE: &str = "Owned browsing requires macOS 14 or later with an iso
 pub(super) const GATE_ERROR: &str =
     "The isolated browser could not be secured. No external page was opened.";
 
+/// Every security gate funnels through here: one line per failure lands in
+/// `<app data>/browser-gate.log` (site + error code + timestamp) so a live
+/// failure is diagnosable without GUI automation. The user-visible message
+/// stays GATE_ERROR; only the code/log differ per site.
+pub(super) fn gate(app: Option<&AppHandle>, site: &str, code: &str) -> AppError {
+    if let Some(app) = app {
+        if let Ok(dir) = app.path().app_data_dir() {
+            use std::io::Write;
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(dir.join("browser-gate.log"))
+            {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let _ = writeln!(file, "{now} site={site} code={code}");
+            }
+        }
+    }
+    AppError::new(
+        match code {
+            "browser_profile_unavailable" => "browser_profile_unavailable",
+            _ => "browser_unavailable",
+        },
+        GATE_ERROR,
+    )
+}
+
 /// Requested engine backend. Wire-level identifier the frontend passes when
 /// calling `browser_open`; missing/None defaults to `webkit`.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]

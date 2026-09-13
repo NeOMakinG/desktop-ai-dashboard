@@ -21,6 +21,7 @@ use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
 
 const BASE_URL: &str = "https://backend.composio.dev/api/v3";
+const DEFAULT_RELAY_URL: &str = "http://100.90.255.43:9231";
 const CALLBACK_PATH: &str = "/composio/callback";
 const CALLBACK_TIMEOUT: Duration = Duration::from_secs(180);
 const OPEN_TIMEOUT: Duration = Duration::from_secs(10);
@@ -197,6 +198,7 @@ pub struct ServiceStatus {
 pub struct Snapshot {
     pub revision: u64,
     pub key_configured: bool,
+    pub relay: bool,
     pub attempt: Option<AttemptStatus>,
     pub items: Vec<ServiceStatus>,
 }
@@ -250,6 +252,10 @@ pub struct ComposioCore {
     inner: Mutex<Inner>,
     keys: Arc<dyn ComposioKeys>,
     client: reqwest::Client,
+    /// Founder relay mode (2026-09-13): when a relay token exists the app
+    /// routes every Composio call through the Forma relay and the project
+    /// API key never touches this machine. Relay wins over a stored key.
+    relay: Option<(reqwest::Url, Arc<Zeroizing<String>>)>,
 }
 /// App-scoped rather than process-global; QA key storage is namespaced like
 /// the Google connector secrets and never falls back to the production entry.
@@ -276,12 +282,28 @@ impl ComposioState {
                     }),
                     keys: Arc::new(ComposioKeyStore::new(self.test_directory.as_deref())),
                     client: build_client()?,
+                    relay: if self.test_directory.is_none() {
+                        production_relay()
+                    } else {
+                        None
+                    },
                 }))
             })
             .as_ref()
             .map(Arc::clone)
             .map_err(Clone::clone)
     }
+}
+fn production_relay() -> Option<(reqwest::Url, Arc<Zeroizing<String>>)> {
+    let token = Arc::new(crate::connectors::keychain::relay_token()?);
+    let base = std::env::var("FORMA_COMPOSIO_RELAY")
+        .ok()
+        .and_then(|value| reqwest::Url::parse(&value).ok())
+        .filter(|url| matches!(url.scheme(), "http" | "https"))
+        .unwrap_or_else(|| {
+            reqwest::Url::parse(DEFAULT_RELAY_URL).expect("static relay URL parses")
+        });
+    Some((base, token))
 }
 fn build_client() -> AppResult<reqwest::Client> {
     reqwest::Client::builder()
@@ -311,10 +333,20 @@ fn emit_change(app: &AppHandle) {
 
 impl ComposioCore {
     fn http(&self) -> AppResult<ComposioHttp> {
+        if let Some((base, token)) = &self.relay {
+            return Ok(ComposioHttp {
+                client: self.client.clone(),
+                key: Arc::new(Zeroizing::new(String::new())),
+                relay_base: Some(base.clone()),
+                relay_token: Some(Arc::clone(token)),
+            });
+        }
         let key = self.keys.read()?;
         Ok(ComposioHttp {
             client: self.client.clone(),
             key: Arc::new(key),
+            relay_base: None,
+            relay_token: None,
         })
     }
     /// Single-flight connection attempt; a terminal transition frees the slot
@@ -553,6 +585,8 @@ trait Transport: Send + Sync {
 struct ComposioHttp {
     client: reqwest::Client,
     key: Arc<Zeroizing<String>>,
+    relay_base: Option<reqwest::Url>,
+    relay_token: Option<Arc<Zeroizing<String>>>,
 }
 impl ComposioHttp {
     fn key_header(
@@ -600,14 +634,29 @@ impl Transport for ComposioHttp {
         body: Option<String>,
     ) -> Pin<Box<dyn Future<Output = AppResult<Zeroizing<Vec<u8>>>> + Send + '_>> {
         Box::pin(async move {
-            // Docs-canonical x-api-key plus the spike-verified Bearer form.
-            let (bearer, api_key) = self.key_header()?;
-            let mut builder = self
-                .client
-                .request(method, url)
-                .header(reqwest::header::AUTHORIZATION, bearer)
-                .header("x-api-key", api_key)
-                .header(reqwest::header::ACCEPT, "application/json");
+            // Direct mode: docs-canonical x-api-key only. Sending x-api-key and
+            // Bearer together is rejected upstream (401), so the Bearer form is
+            // reserved for the relay token below.
+            let mut builder = if let (Some(base), Some(token)) =
+                (&self.relay_base, &self.relay_token)
+            {
+                let target = relay_url(base, &url)?;
+                let mut header = reqwest::header::HeaderValue::from_str(&format!(
+                    "Bearer {}",
+                    token.as_str()
+                ))
+                .map_err(|_| AppError::invalid())?;
+                header.set_sensitive(true);
+                self.client
+                    .request(method, target)
+                    .header(reqwest::header::AUTHORIZATION, header)
+            } else {
+                let (_, api_key) = self.key_header()?;
+                self.client
+                    .request(method, url)
+                    .header("x-api-key", api_key)
+            };
+            builder = builder.header(reqwest::header::ACCEPT, "application/json");
             if let Some(body) = &body {
                 builder = builder
                     .header(reqwest::header::CONTENT_TYPE, "application/json")
@@ -635,6 +684,16 @@ impl Transport for ComposioHttp {
     }
 }
 
+fn relay_url(base: &reqwest::Url, url: &reqwest::Url) -> AppResult<reqwest::Url> {
+    let path = url.path();
+    if !path.starts_with("/api/v3/") || path.len() > 512 {
+        return Err(AppError::invalid());
+    }
+    let mut target = base.clone();
+    target.set_path(path);
+    target.set_query(url.query());
+    Ok(target)
+}
 fn api(path: &str) -> AppResult<reqwest::Url> {
     reqwest::Url::parse(&format!("{BASE_URL}{path}")).map_err(|_| AppError::invalid())
 }
@@ -928,7 +987,8 @@ pub async fn composio_status(window: WebviewWindow, app: AppHandle) -> AppResult
     let core = core(&app)?;
     let attempt = core.snapshot_attempt();
     let revision = core.revision();
-    let key_configured = core.keys.has();
+    let relay = core.relay.is_some();
+    let key_configured = relay || core.keys.has();
     // While the native callback thread drives a live attempt, snapshots stay
     // in memory: no extra Composio round trips from renderer polling (F9).
     // That thread emits composio:changed on every transition; the snapshot
@@ -948,6 +1008,7 @@ pub async fn composio_status(window: WebviewWindow, app: AppHandle) -> AppResult
     Ok(Snapshot {
         revision,
         key_configured,
+        relay,
         attempt,
         items,
     })
@@ -1075,6 +1136,8 @@ pub async fn composio_start(
     let thread_http = ComposioHttp {
         client: http.client.clone(),
         key: Arc::clone(&http.key),
+        relay_base: None,
+        relay_token: None,
     };
     let app_handle = app.clone();
     let thread_id = id.clone();
@@ -1365,6 +1428,7 @@ mod tests {
             }),
             keys: Arc::new(keys),
             client: build_client().unwrap(),
+            relay: None,
         })
     }
     fn service_fixture() -> serde_json::Value {
@@ -1838,6 +1902,8 @@ mod tests {
         let http = ComposioHttp {
             client: build_client().unwrap(),
             key: Arc::new(Zeroizing::new("ak_synthetic-key-123456".to_owned())),
+            relay_base: None,
+            relay_token: None,
         };
         let (bearer, api_key) = http.key_header().unwrap();
         assert_eq!(bearer.to_str().unwrap(), "Bearer ak_synthetic-key-123456");
@@ -1858,6 +1924,44 @@ mod tests {
         }
     }
     #[test]
+    #[test]
+    fn relay_url_maps_api_paths_and_rejects_others() {
+        let base = reqwest::Url::parse("http://100.90.255.43:9231").unwrap();
+        let mapped = relay_url(
+            &base,
+            &reqwest::Url::parse("https://backend.composio.dev/api/v3/toolkits?search=g&limit=30")
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            mapped.as_str(),
+            "http://100.90.255.43:9231/api/v3/toolkits?search=g&limit=30"
+        );
+        let foreign = reqwest::Url::parse("https://backend.composio.dev/v2/toolkits").unwrap();
+        assert!(relay_url(&base, &foreign).is_err());
+    }
+
+    #[test]
+    fn relay_mode_reports_configured_without_a_direct_key() {
+        let core = Arc::new(ComposioCore {
+            inner: Mutex::new(Inner {
+                revision: 0,
+                pending: None,
+                attempt_status: None,
+                prompts: Vec::new(),
+            }),
+            keys: Arc::new(MemoryKeys::default()),
+            client: build_client().unwrap(),
+            relay: Some((
+                reqwest::Url::parse("http://127.0.0.1:9").unwrap(),
+                Arc::new(Zeroizing::new("forma-relay-test-token-0123456789".to_owned())),
+            )),
+        });
+        assert!(!core.keys.has());
+        let http = core.http().unwrap();
+        assert!(http.relay_base.is_some() && http.relay_token.is_some());
+    }
+
     fn snapshots_never_contain_key_material() {
         let keys = MemoryKeys::default();
         keys.write("ak_synthetic-key-123456").unwrap();

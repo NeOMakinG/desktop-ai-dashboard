@@ -33,6 +33,7 @@ export interface ComposioAttempt {
 export interface ServicesSnapshot {
   revision: number;
   keyConfigured: boolean;
+  relay: boolean;
   attempt: ComposioAttempt | null;
   items: ConnectedService[];
 }

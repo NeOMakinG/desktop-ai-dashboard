@@ -98,6 +98,17 @@ impl ComposioKeyStore {
     }
 }
 
+/// Forma relay token (founder decision 2026-09-13): present when services run
+/// through the Forma relay instead of a locally stored Composio key.
+pub fn relay_token() -> Option<Zeroizing<String>> {
+    let entry = keyring::Entry::new("dev.forma.relay.v1", "token").ok()?;
+    entry
+        .get_password()
+        .ok()
+        .filter(|value| !value.is_empty())
+        .map(Zeroizing::new)
+}
+
 fn composio_key_error() -> AppError {
     AppError::new(
         "composio_key_store",

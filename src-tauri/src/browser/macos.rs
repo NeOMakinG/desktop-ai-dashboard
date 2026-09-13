@@ -24,20 +24,20 @@ pub(super) fn open(
     engine_session: bool,
 ) -> AppResult<()> {
     if !supported() {
-        return Err(AppError::new("browser_unavailable", GATE_ERROR));
+        return Err(super::gate(Some(app), "supported", "browser_unsupported"));
     }
-    let mtm =
-        MainThreadMarker::new().ok_or_else(|| AppError::new("browser_unavailable", GATE_ERROR))?;
+    let mtm = MainThreadMarker::new()
+        .ok_or_else(|| super::gate(Some(app), "main_thread", "browser_no_main_thread"))?;
     let root = state
         .directory
         .as_deref()
-        .ok_or_else(|| AppError::new("browser_profile_unavailable", GATE_ERROR))?;
+        .ok_or_else(|| super::gate(Some(app), "state_directory", "browser_profile_unavailable"))?;
     let id = profile::load_or_create(root)?;
     let state = state.clone();
     let app = app.clone();
     // This is a compiled-rule cache, NOT WKWebsiteDataStore.defaultDataStore.
     let compiler = unsafe { WKContentRuleListStore::defaultStore(mtm) }
-        .ok_or_else(|| AppError::new("browser_unavailable", GATE_ERROR))?;
+        .ok_or_else(|| super::gate(Some(&app), "rule_store", "browser_rule_store_unavailable"))?;
     let completion = RcBlock::new(move |rule: *mut WKContentRuleList, error: *mut NSError| {
         if !state.current(generation) {
             return;
@@ -47,6 +47,7 @@ pub(super) fn open(
             return;
         };
         if !error.is_null() || rule.is_null() {
+            super::gate(Some(&app), "rule_compile", "browser_rule_compile_failed");
             state.fail(generation);
             return;
         }
@@ -63,7 +64,8 @@ pub(super) fn open(
                 engine_session,
             )
         };
-        if result.is_err() {
+        if let Err(failure) = result {
+            super::gate(Some(&app), "build", failure.code);
             state.fail(generation);
         }
     });
@@ -97,7 +99,7 @@ unsafe fn build(
     if !data_store.isPersistent()
         || data_store.identifier().map(|x| x.as_bytes()) != Some(*id.as_bytes())
     {
-        return Err(AppError::new("browser_unavailable", GATE_ERROR));
+        return Err(super::gate(Some(app), "data_store", "browser_data_store_mismatch"));
     }
     config.setWebsiteDataStore(&data_store);
     let controller = config.userContentController();
@@ -136,7 +138,7 @@ unsafe fn build(
         load_state.emit();
     })
     .build()
-    .map_err(|_| AppError::new("browser_unavailable", GATE_ERROR))?;
+    .map_err(|_| super::gate(Some(app), "window_build", "browser_window_build_failed"))?;
     let closed_state = state.clone();
     window.on_window_event(move |event| {
         if matches!(event, tauri::WindowEvent::Destroyed) {
@@ -218,6 +220,7 @@ unsafe fn build(
         });
     });
     if result.is_err() {
+        super::gate(Some(app), "webview_verify", "browser_webview_verification_failed");
         state.fail(generation);
         let _ = window.destroy();
         return Err(AppError::new("browser_unavailable", GATE_ERROR));
