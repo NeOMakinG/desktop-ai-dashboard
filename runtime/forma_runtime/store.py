@@ -445,6 +445,7 @@ class Store:
         if outcome == "succeeded":
             require("data" in body and "error" not in body, "Success needs data only")
             if request["toolName"] in COMPOSIO_TOOLS: composio_result(body["data"], request)
+            elif request["toolName"] in BROWSER_TOOLS: browser_result(body["data"], request)
             else: google_result(body["data"], request)
         else:
             require("error" in body and "data" not in body, "Failure needs error only")
@@ -479,13 +480,15 @@ class Store:
             if name == "forma_schedule_create":
                 obj(args, ("interfaceId", "expectedInterfaceRevision", "prompt", "cron", "timezone", "endAt", "maxRuns", "budgets"))
                 return self.create_schedule(dict(args, workspaceId=run["workspaceId"], modelId=run["modelId"], grantRefs=run["_input"]["grantRefs"]), run)
-            if name in COMPOSIO_TOOLS:
-                # Connection-status tools bridge to the native Composio host.
-                # They carry no account read authority, so no grant applies;
-                # the connection/grant ids are opaque placeholders the host
-                # re-validates by run, workspace and device identity.
-                if name == COMPOSIO_TOOLS[0]: obj(args)
-                else: composio_args(args)
+            if name in COMPOSIO_TOOLS or name in BROWSER_TOOLS:
+                # Connection-status and browser-session tools bridge to the
+                # native host. They carry no account read authority, so no
+                # grant applies; the connection/grant ids are opaque
+                # placeholders the host re-validates by run, workspace and
+                # device identity. The browser CDP hand-off is additionally
+                # gated host-side on the user's default-off drive preference.
+                if name == COMPOSIO_TOOLS[1]: composio_args(args)
+                else: obj(args)
                 request = {"id": new_id(), "runId": rid, "workspaceId": run["workspaceId"], "deviceId": self.device_id,
                            "connectionId": new_id(), "grantRef": {"id": new_id(), "generation": 1},
                            "toolName": name, "args": args, "expiresAt": stamp(instant(run["_deadline"])), "state": "pending"}

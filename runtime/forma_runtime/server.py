@@ -29,7 +29,8 @@ class Application:
                 "features": {"eventPolling": True, "interfaces": True, "schedules": True, "nativeToolBridge": True,
                              "generatedCodeExecution": False, "liveGoogle": False},
                 "tools": [{"name": name, "available": name not in GOOGLE_TOOLS and self.config.ready(),
-                           "execution": "nativeDevice" if name in GOOGLE_TOOLS or name in COMPOSIO_TOOLS else "runtime",
+                           "execution": "nativeDevice" if name in GOOGLE_TOOLS or name in COMPOSIO_TOOLS
+                           or name in BROWSER_TOOLS else "runtime",
                            **({"reason": "explicit_synthetic_grant_required"} if name in GOOGLE_TOOLS else {})} for name in TOOLS],
                 "limits": dict(LIMITS, dailyModelRequests=self.config.daily_limit, maxQueuedRuns=8)}
 

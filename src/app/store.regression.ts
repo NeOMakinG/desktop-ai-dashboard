@@ -30,7 +30,7 @@ class MemoryStorage implements Storage {
 const clone = <T,>(value: T): T => structuredClone(value);
 const timestamp = () => new Date().toISOString();
 const settings = (): AppSettings => ({
-  schemaVersion: 1, onboardingComplete: true, onboardingStep: 2, displayName: '', ambientMotion: false,
+  schemaVersion: 1, onboardingComplete: true, onboardingStep: 2, displayName: '', ambientMotion: false, assistantBrowserDrive: false,
   provider: { label: 'Test connection', baseUrl: 'http://localhost:9999/v1', model: 'test-model', hasKey: false, verified: true, lastCheckedAt: null },
 });
 

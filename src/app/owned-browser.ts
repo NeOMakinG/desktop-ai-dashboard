@@ -6,6 +6,7 @@ import { acceptsBrowserRevision, browserActionFailure, type BrowserEngine, type 
 const unavailable: OwnedBrowserStatus = {
   revision: 0, available: false, phase: 'unavailable', engine: 'unavailable', persistent: false,
   availableEngines: [], chromiumUnavailableReason: null,
+  realChromium: { supported: false, installed: false, phase: 'idle', progressPercent: null, pid: null, cdpReady: false, error: null, version: '' },
   profileId: null, url: null, service: null, error: null, automationReady: false,
   interactive: false, navigating: false,
 };

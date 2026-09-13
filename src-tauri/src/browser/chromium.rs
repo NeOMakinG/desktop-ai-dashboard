@@ -1,630 +1,637 @@
-//! Chromium remains unavailable. Post-launch CDP filters cannot protect startup,
-//! restored tabs, background requests or new targets before attachment. No child
-//! process or pipe transport exists in this runtime. The offline detection,
-//! profile and protocol fixtures below are retained research, not security proof.
-//! Re-enablement requires independently reviewed pre-launch egress containment.
-#![cfg_attr(not(test), allow(dead_code))]
-
+//! REAL Chrome-for-Testing engine (founder directive 2026-09-13).
+//!
+//! One real, headful Chromium that the user browses and signs into directly,
+//! and that the assistant may drive over local CDP only when the user enables
+//! it. Deliberate design decisions, each the opposite of the old stub:
+//! * FULL Chrome for Testing, pinned by version + sha256, downloaded on first
+//!   use into the app data dir and extracted with `/usr/bin/ditto -x -k`
+//!   (preserves the .app framework symlinks that break naive bundling).
+//! * NO headless flags and NO proxy: the whole point is the user's own
+//!   browser fingerprint on the user's own residential IP. Routing this
+//!   browser through a relay or shared egress would defeat the ban-resistant
+//!   design, so egress policy is intentionally the OS default.
+//! * CDP on an ephemeral loopback port (`--remote-debugging-port=0`; Chrome
+//!   binds 127.0.0.1 and writes the port to `DevToolsActivePort` inside the
+//!   profile). The endpoint is handed to the runtime ONLY while the browser
+//!   runs AND the user has switched on "assistant may drive the browser"
+//!   (default OFF, stored with the other preferences).
+//! * The profile persists under the app data dir, so the user's sign-ins
+//!   survive restarts. Forma never copies or reads other browsers' profiles.
+//! * The child is not killed when a chat ends (`kill_on_drop(false)` — the
+//!   browser may outlive a conversation) but is reaped on app quit through
+//!   the same owned-process discipline as every other Forma child.
 use crate::types::{AppError, AppResult};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::{
     fs,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::Mutex,
+    time::Duration,
 };
-pub(super) const UNAVAILABLE_REASON: &str = "Chromium is unavailable: startup, restored tabs, background traffic and new targets cannot yet be blocked before network access. No Chromium process was started. Use isolated WebKit on macOS 14 or later.";
 
-pub(super) fn require_available() -> AppResult<()> {
-    Err(AppError::new("browser_unavailable", UNAVAILABLE_REASON))
+/// Pinned Chrome for Testing build. Verified 2026-09-13: the CDN serves this
+/// exact zip (187,406,357 bytes) and the extracted binary reports
+/// "Google Chrome for Testing 151.0.7922.34".
+pub(crate) const CFT_VERSION: &str = "151.0.7922.34";
+pub(crate) const CFT_URL: &str =
+    "https://cdn.playwright.dev/builds/cft/151.0.7922.34/mac-arm64/chrome-mac-arm64.zip";
+pub(crate) const CFT_SHA256: &str =
+    "01a23ef9501b2745e0c2944c2e583207e6f6132d8d91c3a87ff65b5079e438ef";
+const CFT_EXECUTABLE_RELATIVE: &str =
+    "chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing";
+
+pub(crate) const ENGINE_ID: &str = "chromium";
+pub(crate) const ENGINE_LABEL: &str = "Chrome (full browser)";
+pub(super) const PLATFORM_UNAVAILABLE: &str =
+    "The full Chrome browser is packaged for Apple silicon macOS only.";
+
+pub(super) fn supported() -> bool {
+    cfg!(all(target_os = "macos", target_arch = "aarch64"))
 }
 
-/// Higgsfield denylist installed via CDP `Network.setBlockedURLs`. Kept as a
-/// single wildcard for parity with the WebKit content-blocker rule
-/// (`.*higgsfield.*`); Chromium blocklist patterns are glob-style so `*` is
-/// the "match anything" wildcard.
-pub(super) const HG_BLOCKED_URLS: &[&str] = &["*higgsfield*"];
+// ---------------------------------------------------------------------------
+// Owned paths — everything lives under `<app data>/real-browser/`.
+// ---------------------------------------------------------------------------
 
-/// Static launch flags for the managed Chromium child. Order is not important
-/// but each flag exists for a specific reason:
-/// * `--remote-debugging-pipe` — CDP over fds 3/4; **never** a network port.
-/// * `--disable-default-apps` — a fresh profile is not seeded with Chrome apps.
-/// * `--no-first-run` — no first-run tab / welcome dialog.
-/// * `--no-default-browser-check` — never asks to become the OS default.
-/// * `--disable-features=ChromeWhatsNewUI` — no unsolicited What's New page.
-pub(super) const LAUNCH_FLAGS: &[&str] = &[
-    "--remote-debugging-pipe",
-    "--disable-default-apps",
-    "--no-first-run",
-    "--no-default-browser-check",
-    "--disable-features=ChromeWhatsNewUI",
-];
-
-/// Distinct build we detected on the host. `label` is what the UI displays and
-/// must remain truthful — "System Chrome" for Google Chrome, "Chrome Canary"
-/// for Canary, "Chromium" for open-source Chromium. Never label a WebKit
-/// engine as Chromium (or vice versa).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct ChromiumInstall {
-    pub label: &'static str,
-    pub kind: ChromiumKind,
-    pub path: PathBuf,
+pub(super) fn real_root(app_data: &Path) -> PathBuf {
+    app_data.join("real-browser")
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(super) enum ChromiumKind {
-    Chrome,
-    ChromeCanary,
-    Chromium,
+pub(super) fn install_root(app_data: &Path) -> PathBuf {
+    real_root(app_data).join("chromium-151")
 }
 
-/// Ordered list of candidate locations per platform. The first executable
-/// build wins for each `ChromiumKind` — so a user-installed Google Chrome is
-/// preferred over a bundled path if both existed.
-fn candidates() -> Vec<(&'static str, ChromiumKind, PathBuf)> {
-    #[allow(unused_mut)]
-    let mut list: Vec<(&'static str, ChromiumKind, PathBuf)> = Vec::new();
-    #[cfg(target_os = "macos")]
-    {
-        list.push((
-            "System Chrome",
-            ChromiumKind::Chrome,
-            PathBuf::from("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
-        ));
-        list.push((
-            "Chrome Canary",
-            ChromiumKind::ChromeCanary,
-            PathBuf::from(
-                "/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary",
-            ),
-        ));
-        list.push((
-            "Chromium",
-            ChromiumKind::Chromium,
-            PathBuf::from("/Applications/Chromium.app/Contents/MacOS/Chromium"),
-        ));
-    }
-    #[cfg(target_os = "linux")]
-    {
-        for (label, kind, path) in [
-            (
-                "System Chrome",
-                ChromiumKind::Chrome,
-                "/usr/bin/google-chrome-stable",
-            ),
-            (
-                "System Chrome",
-                ChromiumKind::Chrome,
-                "/usr/bin/google-chrome",
-            ),
-            ("Chromium", ChromiumKind::Chromium, "/usr/bin/chromium"),
-            (
-                "Chromium",
-                ChromiumKind::Chromium,
-                "/usr/bin/chromium-browser",
-            ),
-        ] {
-            list.push((label, kind, PathBuf::from(path)));
-        }
-    }
-    #[cfg(target_os = "windows")]
-    {
-        list.push((
-            "System Chrome",
-            ChromiumKind::Chrome,
-            PathBuf::from(r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
-        ));
-        list.push((
-            "System Chrome",
-            ChromiumKind::Chrome,
-            PathBuf::from(r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"),
-        ));
-    }
-    list
+pub(super) fn executable_path(app_data: &Path) -> PathBuf {
+    install_root(app_data).join(CFT_EXECUTABLE_RELATIVE)
 }
 
-/// Public detection entry point — uses the real filesystem.
-pub(super) fn detect() -> Vec<ChromiumInstall> {
-    detect_from(&candidates(), &is_executable)
+/// Persistent profile: the user's real sign-ins live here and survive
+/// restarts. Never a temp dir, never another browser's profile.
+pub(super) fn profile_dir(app_data: &Path) -> PathBuf {
+    real_root(app_data).join("profiles").join("default")
 }
 
-/// Testable detection kernel — the exists predicate is injected so unit tests
-/// never touch `/Applications/`. Keeps only the first hit per `ChromiumKind`.
-pub(super) fn detect_from(
-    candidates: &[(&'static str, ChromiumKind, PathBuf)],
-    exists: &dyn Fn(&Path) -> bool,
-) -> Vec<ChromiumInstall> {
-    use std::collections::BTreeSet;
-    let mut seen: BTreeSet<ChromiumKind> = BTreeSet::new();
-    let mut engines: Vec<ChromiumInstall> = Vec::new();
-    for (label, kind, path) in candidates {
-        if seen.contains(kind) {
-            continue;
-        }
-        if !exists(path) {
-            continue;
-        }
-        seen.insert(*kind);
-        engines.push(ChromiumInstall {
-            label,
-            kind: *kind,
-            path: path.clone(),
-        });
-    }
-    engines
+fn zip_path(app_data: &Path) -> PathBuf {
+    real_root(app_data).join("downloads").join("chrome-mac-arm64.zip")
 }
 
-/// True when the path exists as a regular file with any executable bit set on
-/// Unix, or exists at all on Windows.
-pub(super) fn is_executable(path: &Path) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        match fs::symlink_metadata(path) {
-            Ok(metadata) => {
-                metadata.file_type().is_file() && metadata.permissions().mode() & 0o111 != 0
-            }
-            Err(_) => false,
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        fs::symlink_metadata(path)
-            .map(|m| m.file_type().is_file())
-            .unwrap_or(false)
-    }
+pub(super) fn installed(app_data: &Path) -> bool {
+    let path = executable_path(app_data);
+    fs::metadata(&path).map(|m| m.is_file()).unwrap_or(false)
 }
 
-/// Root directory Forma owns for managed-Chromium user-data. Distinct from
-/// `owned-browser/` so the WebKit engine's profile never mixes with Chromium
-/// state and vice versa.
-pub(super) fn user_data_root(app_data: &Path) -> PathBuf {
-    app_data.join("managed-chromium")
-}
+// ---------------------------------------------------------------------------
+// Launch arguments — isolated from spawning so tests inspect the command line.
+// ---------------------------------------------------------------------------
 
-/// Prepare (create if missing) the Forma-owned user-data-dir. Refuses to
-/// operate on symlinks, world-readable directories, or paths owned by another
-/// UID — the same posture `profile.rs` uses for the WebKit profile-id file.
-/// **Never** returns a path that could resolve into the user's normal Chrome
-/// profile (`~/Library/Application Support/Google/Chrome`), because we only
-/// construct paths under `<app_data>/managed-chromium/`.
-#[cfg(unix)]
-pub(super) fn prepare_user_data_dir(app_data: &Path) -> AppResult<PathBuf> {
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
-    if !app_data.is_absolute()
-        || !fs::symlink_metadata(app_data)
-            .map_err(|_| unavailable())?
-            .is_dir()
-    {
-        return Err(unavailable());
-    }
-    let directory = user_data_root(app_data);
-    match fs::DirBuilder::new().mode(0o700).create(&directory) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(_) => return Err(unavailable()),
-    }
-    let metadata = fs::symlink_metadata(&directory).map_err(|_| unavailable())?;
-    if !metadata.is_dir()
-        || metadata.permissions().mode() & 0o077 != 0
-        || metadata.uid() != unsafe { libc::geteuid() }
-    {
-        return Err(unavailable());
-    }
-    Ok(directory)
-}
-
-#[cfg(not(unix))]
-pub(super) fn prepare_user_data_dir(app_data: &Path) -> AppResult<PathBuf> {
-    if !app_data.is_absolute() {
-        return Err(unavailable());
-    }
-    let directory = user_data_root(app_data);
-    if let Err(e) = fs::create_dir_all(&directory) {
-        if e.kind() != std::io::ErrorKind::AlreadyExists {
-            return Err(unavailable());
-        }
-    }
-    Ok(directory)
-}
-
-fn unavailable() -> AppError {
-    AppError::new("browser_unavailable", super::GATE_ERROR)
-}
-
-/// Build the argv (arguments only — not argv[0]) for the Chromium child.
-/// Isolated from spawning so tests can inspect the command line without ever
-/// launching a browser.
-pub(super) fn build_argv(user_data_dir: &Path, target_url: Option<&str>) -> Vec<String> {
-    let mut argv: Vec<String> = Vec::with_capacity(1 + LAUNCH_FLAGS.len() + 1);
-    argv.push(format!("--user-data-dir={}", user_data_dir.display()));
-    for flag in LAUNCH_FLAGS {
-        argv.push((*flag).to_string());
-    }
+/// Build argv (arguments only, not argv[0]) for the real browser child.
+/// * `--user-data-dir` first so nothing can override the owned profile.
+/// * `--remote-debugging-port=0` — ephemeral CDP on 127.0.0.1; Chrome writes
+///   the chosen port to `DevToolsActivePort` inside the profile.
+/// * NO headless flag and NO `--proxy-server`: user's real window, user's
+///   real IP (see module docs — this is the anti-ban design, on purpose).
+pub(super) fn build_argv(profile: &Path, target_url: Option<&str>) -> Vec<String> {
+    let mut argv = vec![
+        format!("--user-data-dir={}", profile.display()),
+        "--remote-debugging-port=0".to_string(),
+        "--no-first-run".to_string(),
+        "--no-default-browser-check".to_string(),
+    ];
     if let Some(url) = target_url {
         argv.push(url.to_string());
     }
     argv
 }
 
-/// CDP wire format for `--remote-debugging-pipe`: each direction is a
-/// concatenation of UTF-8 JSON objects, each terminated by a single NUL byte.
-/// Returns owned bytes so the caller can hand them straight to a pipe writer.
-pub(super) fn frame(message: &str) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(message.len() + 1);
-    bytes.extend_from_slice(message.as_bytes());
-    bytes.push(0);
-    bytes
+/// First line of the profile's `DevToolsActivePort` file is the bound port.
+pub(super) fn parse_devtools_port(content: &str) -> Option<u16> {
+    let port: u16 = content.lines().next()?.trim().parse().ok()?;
+    (port != 0).then_some(port)
 }
 
-/// Split an input buffer at NUL boundaries. Ignores an empty trailing frame
-/// produced by a still-open stream. Never allocates the message bodies.
-pub(super) fn split_frames(buffer: &[u8]) -> Vec<&[u8]> {
-    let mut out = Vec::new();
-    let mut start = 0usize;
-    for (index, byte) in buffer.iter().enumerate() {
-        if *byte == 0 {
-            if start < index {
-                out.push(&buffer[start..index]);
-            }
-            start = index + 1;
-        }
-    }
-    out
+// ---------------------------------------------------------------------------
+// Status surfaced to the renderer (BrowserView status card).
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug, Default, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RealPhase {
+    #[default]
+    Idle,
+    Downloading,
+    Extracting,
+    Verifying,
+    Launching,
+    Running,
+    Exited,
+    Error,
 }
 
-/// Offline protocol fixture: Network commands require an attached target's
-/// flat session. The browser/root session does not support this domain.
-pub(super) fn blocked_urls_message(id: u64, session_id: &str) -> String {
-    #[derive(Serialize)]
-    struct Msg<'a> {
-        id: u64,
-        method: &'a str,
-        params: Params<'a>,
-        #[serde(rename = "sessionId")]
-        session_id: &'a str,
-    }
-    #[derive(Serialize)]
-    struct Params<'a> {
-        urls: &'a [&'a str],
-    }
-    serde_json::to_string(&Msg {
-        id,
-        method: "Network.setBlockedURLs",
-        params: Params {
-            urls: HG_BLOCKED_URLS,
-        },
-        session_id,
-    })
-    .expect("static CDP message serializes")
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RealChromiumStatus {
+    pub supported: bool,
+    pub installed: bool,
+    pub phase: RealPhase,
+    /// Download progress while `phase == downloading`.
+    pub progress_percent: Option<u8>,
+    pub pid: Option<u32>,
+    /// True while the loopback CDP endpoint answered `/json/version`.
+    pub cdp_ready: bool,
+    pub error: Option<&'static str>,
+    pub version: &'static str,
 }
 
-/// Offline protocol transport; tests buffer messages in memory. There is no
-/// runtime pipe implementation. A future implementation needs bounded,
-/// cancellable reads/writes and supervised child reaping before enablement.
-pub(super) trait CdpTransport {
-    fn write_message(&mut self, message: &str) -> std::io::Result<()>;
-    fn read_message(&mut self) -> std::io::Result<Option<String>>;
+#[derive(Default)]
+struct RealInner {
+    phase: RealPhase,
+    progress: Option<u8>,
+    pid: Option<u32>,
+    cdp_port: Option<u16>,
+    error: Option<&'static str>,
+    busy: bool,
+    generation: u64,
 }
 
-/// Send `Network.setBlockedURLs(HG_BLOCKED_URLS)` and read one response with a
-/// matching `id`. Returns an error if the response is a CDP `error` object or
-/// if the stream ends before a matching reply arrives.
-pub(super) fn install_higgsfield_block(
-    transport: &mut dyn CdpTransport,
-    id_gen: &AtomicU64,
-    session_id: &str,
-) -> std::io::Result<()> {
-    if session_id.is_empty() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "CDP target session required",
-        ));
-    }
-    let id = id_gen.fetch_add(1, Ordering::SeqCst);
-    let message = blocked_urls_message(id, session_id);
-    transport.write_message(&message)?;
-    loop {
-        let reply = transport.read_message()?;
-        let Some(text) = reply else {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "CDP stream ended before blocked-URL ack",
-            ));
+/// Shared real-browser lifecycle state. Lock discipline mirrors `Session`:
+/// short critical sections, never held across awaits.
+#[derive(Default)]
+pub(crate) struct RealChromium {
+    inner: Mutex<RealInner>,
+}
+
+impl RealChromium {
+    pub(super) fn snapshot(&self, app_data: Option<&Path>) -> RealChromiumStatus {
+        let inner = self.inner.lock();
+        let (phase, progress, pid, cdp, error) = match &inner {
+            Ok(inner) => (
+                inner.phase,
+                inner.progress,
+                inner.pid,
+                inner.cdp_port.is_some(),
+                inner.error,
+            ),
+            Err(_) => (RealPhase::Error, None, None, false, Some(super::GATE_ERROR)),
         };
-        let value: serde_json::Value = serde_json::from_str(&text)
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "malformed CDP"))?;
-        if value.get("id").and_then(|v| v.as_u64()) != Some(id) {
-            // Ignore events (`method` w/o `id`) and unrelated acks.
-            continue;
+        RealChromiumStatus {
+            supported: supported(),
+            installed: app_data.map(installed).unwrap_or(false),
+            phase,
+            progress_percent: progress,
+            pid,
+            cdp_ready: cdp,
+            error,
+            version: CFT_VERSION,
         }
-        if value.get("sessionId").and_then(|v| v.as_str()) != Some(session_id) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "CDP target session mismatch",
-            ));
+    }
+
+    /// Claim the single open/install slot. Returns the generation for this
+    /// attempt, or None when an attempt is already in flight.
+    pub(super) fn begin(&self) -> Option<u64> {
+        let mut inner = self.inner.lock().ok()?;
+        if inner.busy {
+            return None;
         }
-        if value.get("error").is_some() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "CDP rejected Network.setBlockedURLs",
-            ));
+        inner.busy = true;
+        inner.generation = inner.generation.wrapping_add(1);
+        inner.error = None;
+        Some(inner.generation)
+    }
+
+    pub(super) fn progress(&self, generation: u64, phase: RealPhase, percent: Option<u8>) {
+        if let Ok(mut inner) = self.inner.lock() {
+            if inner.generation == generation {
+                inner.phase = phase;
+                inner.progress = percent;
+            }
         }
-        return Ok(());
+    }
+
+    pub(super) fn running(&self, generation: u64, pid: u32, cdp_port: u16) {
+        if let Ok(mut inner) = self.inner.lock() {
+            if inner.generation == generation {
+                inner.phase = RealPhase::Running;
+                inner.progress = None;
+                inner.pid = Some(pid);
+                inner.cdp_port = Some(cdp_port);
+                inner.busy = false;
+            }
+        }
+    }
+
+    pub(super) fn failed(&self, generation: u64, error: &'static str) {
+        if let Ok(mut inner) = self.inner.lock() {
+            if inner.generation == generation {
+                inner.phase = RealPhase::Error;
+                inner.progress = None;
+                inner.pid = None;
+                inner.cdp_port = None;
+                inner.error = Some(error);
+                inner.busy = false;
+            }
+        }
+    }
+
+    /// Child exit observed. Only the generation that launched the child may
+    /// transition the state — a stale monitor cannot clobber a relaunch.
+    pub(super) fn exited(&self, generation: u64) {
+        if let Ok(mut inner) = self.inner.lock() {
+            if inner.generation == generation {
+                inner.phase = RealPhase::Exited;
+                inner.pid = None;
+                inner.cdp_port = None;
+                inner.busy = false;
+            }
+        }
+    }
+
+    /// (pid, cdp_port) while running; verifies the pid is still alive so a
+    /// crashed browser is never reported as available.
+    pub(super) fn live(&self) -> Option<(u32, u16)> {
+        let inner = self.inner.lock().ok()?;
+        if inner.phase != RealPhase::Running {
+            return None;
+        }
+        let (pid, port) = (inner.pid?, inner.cdp_port?);
+        #[cfg(unix)]
+        if unsafe { libc::kill(pid as i32, 0) } != 0 {
+            return None;
+        }
+        Some((pid, port))
+    }
+
+    pub(super) fn generation(&self) -> u64 {
+        self.inner.lock().map(|inner| inner.generation).unwrap_or(0)
+    }
+
+    /// App-quit reaping: the browser never outlives Forma. SIGTERM lets
+    /// Chrome flush the profile (sessions persist for next launch).
+    pub(super) fn terminate(&self) {
+        let pid = self.inner.lock().ok().and_then(|inner| {
+            (inner.phase == RealPhase::Running).then_some(inner.pid).flatten()
+        });
+        #[cfg(unix)]
+        if let Some(pid) = pid {
+            unsafe {
+                libc::kill(pid as i32, libc::SIGTERM);
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = pid;
+        if let Ok(mut inner) = self.inner.lock() {
+            if inner.phase == RealPhase::Running {
+                inner.phase = RealPhase::Exited;
+                inner.pid = None;
+                inner.cdp_port = None;
+                inner.busy = false;
+            }
+        }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Tests — pure Rust; NO runtime spawn, NO Higgsfield calls, NO network I/O.
+// Runtime hand-off: {available, cdpEndpoint} for the forma_browser_session
+// tool. Fail closed on every missing precondition; never an error the model
+// could mistake for a retryable transport fault.
+// ---------------------------------------------------------------------------
+
+pub(crate) fn session_payload(cdp_port: Option<u16>, drive_enabled: bool) -> serde_json::Value {
+    match (cdp_port, drive_enabled) {
+        (Some(port), true) => serde_json::json!({
+            "kind": "browserSession",
+            "available": true,
+            "cdpEndpoint": format!("http://127.0.0.1:{port}"),
+        }),
+        (Some(_), false) | (None, false) if !drive_enabled => serde_json::json!({
+            "kind": "browserSession",
+            "available": false,
+            "detail": "The user has not enabled assistant browser driving.",
+        }),
+        _ => serde_json::json!({
+            "kind": "browserSession",
+            "available": false,
+            "detail": "The user's Forma browser is not running.",
+        }),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Install: download → sha256 → ditto extract → binary --version. Blocking
+// helpers are wrapped by the async caller in spawn_blocking where needed.
+// ---------------------------------------------------------------------------
+
+fn install_error(message: &'static str) -> AppError {
+    AppError::new("browser_install_failed", message)
+}
+
+const DOWNLOAD_FAILED: &str =
+    "The Chrome download could not be completed. Check your connection and try again.";
+const VERIFY_FAILED: &str =
+    "The downloaded Chrome archive failed its integrity check and was discarded.";
+const EXTRACT_FAILED: &str = "The Chrome archive could not be extracted.";
+const BINARY_FAILED: &str = "The extracted Chrome binary did not verify.";
+pub(super) const LAUNCH_FAILED: &str = "The Chrome browser could not be started.";
+
+/// Download the pinned zip with streaming sha256. Returns the verified zip
+/// path. Re-verifies the hash of any previously downloaded zip instead of
+/// trusting it. Progress is reported in whole percent.
+pub(super) async fn download_zip(
+    app_data: &Path,
+    report: impl Fn(u8) + Send + Sync,
+) -> AppResult<PathBuf> {
+    let target = zip_path(app_data);
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent).map_err(|_| install_error(DOWNLOAD_FAILED))?;
+    }
+    if target.is_file() {
+        let existing = target.clone();
+        let hash = tokio::task::spawn_blocking(move || file_sha256(&existing))
+            .await
+            .map_err(|_| install_error(VERIFY_FAILED))?;
+        if hash.as_deref() == Some(CFT_SHA256) {
+            return Ok(target);
+        }
+        let _ = fs::remove_file(&target);
+    }
+    let part = target.with_extension("zip.part");
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(1800))
+        .connect_timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|_| install_error(DOWNLOAD_FAILED))?
+        .get(CFT_URL)
+        .send()
+        .await
+        .map_err(|_| install_error(DOWNLOAD_FAILED))?;
+    if !response.status().is_success() {
+        return Err(install_error(DOWNLOAD_FAILED));
+    }
+    let total = response.content_length().unwrap_or(187_406_357);
+    let mut file = fs::File::create(&part).map_err(|_| install_error(DOWNLOAD_FAILED))?;
+    let mut hash = Sha256::new();
+    let mut written: u64 = 0;
+    let mut response = response;
+    use std::io::Write;
+    loop {
+        let chunk = response
+            .chunk()
+            .await
+            .map_err(|_| install_error(DOWNLOAD_FAILED))?;
+        let Some(chunk) = chunk else { break };
+        hash.update(&chunk);
+        file.write_all(&chunk)
+            .map_err(|_| install_error(DOWNLOAD_FAILED))?;
+        written = written.saturating_add(chunk.len() as u64);
+        if written > 400_000_000 {
+            // Bounded: a hostile mirror cannot fill the disk.
+            let _ = fs::remove_file(&part);
+            return Err(install_error(VERIFY_FAILED));
+        }
+        report(((written.saturating_mul(100)) / total.max(1)).min(100) as u8);
+    }
+    file.flush().map_err(|_| install_error(DOWNLOAD_FAILED))?;
+    drop(file);
+    if format!("{:x}", hash.finalize()) != CFT_SHA256 {
+        let _ = fs::remove_file(&part);
+        return Err(install_error(VERIFY_FAILED));
+    }
+    fs::rename(&part, &target).map_err(|_| install_error(DOWNLOAD_FAILED))?;
+    Ok(target)
+}
+
+fn file_sha256(path: &Path) -> Option<String> {
+    let mut file = fs::File::open(path).ok()?;
+    let mut hash = Sha256::new();
+    std::io::copy(&mut file, &mut hash).ok()?;
+    Some(format!("{:x}", hash.finalize()))
+}
+
+/// Extract with `/usr/bin/ditto -x -k`: unlike naive unzip crates, ditto
+/// preserves the framework symlinks inside the .app (the known bundling
+/// failure mode), which is why the browser is installed at first use instead
+/// of being shipped inside Forma.app.
+pub(super) async fn extract_zip(app_data: &Path, zip: &Path) -> AppResult<()> {
+    let destination = install_root(app_data);
+    let staging = destination.with_extension("staging");
+    let _ = fs::remove_dir_all(&staging);
+    fs::create_dir_all(&staging).map_err(|_| install_error(EXTRACT_FAILED))?;
+    let status = tokio::process::Command::new("/usr/bin/ditto")
+        .arg("-x")
+        .arg("-k")
+        .arg(zip)
+        .arg(&staging)
+        .status()
+        .await
+        .map_err(|_| install_error(EXTRACT_FAILED))?;
+    if !status.success() {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(install_error(EXTRACT_FAILED));
+    }
+    let _ = fs::remove_dir_all(&destination);
+    fs::rename(&staging, &destination).map_err(|_| install_error(EXTRACT_FAILED))?;
+    Ok(())
+}
+
+/// The binary must exist and actually run: `--version` output has to name the
+/// pinned version, otherwise the install is treated as corrupt.
+pub(super) async fn verify_binary(app_data: &Path) -> AppResult<PathBuf> {
+    let binary = executable_path(app_data);
+    if !binary.is_file() {
+        return Err(install_error(BINARY_FAILED));
+    }
+    let output = tokio::process::Command::new(&binary)
+        .arg("--version")
+        .output()
+        .await
+        .map_err(|_| install_error(BINARY_FAILED))?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    if !output.status.success() || !text.contains(CFT_VERSION) {
+        return Err(install_error(BINARY_FAILED));
+    }
+    Ok(binary)
+}
+
+/// Wait for Chrome to publish its ephemeral CDP port, then confirm the
+/// endpoint answers `/json/version`. Loopback-only by construction.
+pub(super) async fn await_cdp(profile: &Path, deadline: Duration) -> AppResult<u16> {
+    let marker = profile.join("DevToolsActivePort");
+    let started = tokio::time::Instant::now();
+    let port = loop {
+        if let Ok(content) = fs::read_to_string(&marker) {
+            if let Some(port) = parse_devtools_port(&content) {
+                break port;
+            }
+        }
+        if started.elapsed() > deadline {
+            return Err(install_error(LAUNCH_FAILED));
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    };
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|_| install_error(LAUNCH_FAILED))?;
+    for _ in 0..20 {
+        if let Ok(response) = client
+            .get(format!("http://127.0.0.1:{port}/json/version"))
+            .send()
+            .await
+        {
+            if response.status().is_success() {
+                return Ok(port);
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    Err(install_error(LAUNCH_FAILED))
+}
+
+// ---------------------------------------------------------------------------
+// Tests — pure Rust; no downloads, no spawns, no network.
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::VecDeque;
-    use std::path::PathBuf;
-    use std::sync::atomic::AtomicU64;
 
     #[test]
-    fn chromium_is_always_unavailable_before_any_side_effect() {
-        let error = require_available().unwrap_err();
-        assert_eq!(error.code, "browser_unavailable");
-        assert_eq!(error.message, UNAVAILABLE_REASON);
+    fn pinned_manifest_is_exactly_the_verified_build() {
+        assert_eq!(CFT_VERSION, "151.0.7922.34");
+        assert!(CFT_URL.starts_with("https://cdn.playwright.dev/builds/cft/151.0.7922.34/"));
+        assert_eq!(CFT_SHA256.len(), 64);
+        assert!(CFT_SHA256.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert!(CFT_EXECUTABLE_RELATIVE.ends_with("Google Chrome for Testing"));
     }
 
+    /// The real browser is headful on the user's own IP: the argv must pin
+    /// the owned profile first, request an ephemeral loopback CDP port, and
+    /// must never contain headless or proxy flags.
     #[test]
-    fn target_session_is_required_before_sending_a_network_command() {
-        let mut transport = StubTransport::new(vec![]);
-        let error = install_higgsfield_block(&mut transport, &AtomicU64::new(1), "").unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
-        assert!(transport.writes.is_empty());
-    }
-
-    #[test]
-    fn root_or_wrong_target_acknowledgment_cannot_secure_a_target() {
-        for reply in [
-            r#"{"id":1,"result":{}}"#,
-            r#"{"id":1,"sessionId":"OTHER","result":{}}"#,
-        ] {
-            let mut transport = StubTransport::new(vec![reply]);
-            let error =
-                install_higgsfield_block(&mut transport, &AtomicU64::new(1), "SID").unwrap_err();
-            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
-        }
-    }
-
-    /// Detection is deterministic, deduplicates by kind (first-in wins), and
-    /// only returns entries the exists predicate accepts. Never touches the
-    /// real filesystem.
-    #[test]
-    fn detects_first_hit_per_kind_and_ignores_missing_binaries() {
-        let candidates = vec![
-            (
-                "System Chrome",
-                ChromiumKind::Chrome,
-                PathBuf::from("/present/google-chrome"),
-            ),
-            (
-                "System Chrome",
-                ChromiumKind::Chrome,
-                PathBuf::from("/also-present/google-chrome-fallback"),
-            ),
-            (
-                "Chrome Canary",
-                ChromiumKind::ChromeCanary,
-                PathBuf::from("/absent/canary"),
-            ),
-            (
-                "Chromium",
-                ChromiumKind::Chromium,
-                PathBuf::from("/present/chromium"),
-            ),
-        ];
-        let exists = |p: &Path| p.starts_with("/present") || p.starts_with("/also-present");
-        let engines = detect_from(&candidates, &exists);
-        // Chrome deduplicated to the first hit; Chromium included; Canary skipped.
-        assert_eq!(engines.len(), 2);
-        assert_eq!(engines[0].kind, ChromiumKind::Chrome);
-        assert_eq!(engines[0].label, "System Chrome");
-        assert_eq!(engines[0].path, PathBuf::from("/present/google-chrome"));
-        assert_eq!(engines[1].kind, ChromiumKind::Chromium);
-        assert_eq!(engines[1].label, "Chromium");
-    }
-
-    /// `detect_from` on an empty exists-predicate returns an empty vec, so
-    /// callers correctly fail closed on platforms with no supported binary.
-    #[test]
-    fn empty_when_no_binary_exists() {
-        let candidates = vec![(
-            "System Chrome",
-            ChromiumKind::Chrome,
-            PathBuf::from("/nope"),
-        )];
-        assert!(detect_from(&candidates, &|_p: &Path| false).is_empty());
-    }
-
-    /// The real `is_executable` accepts a chmod +x file, rejects a plain file,
-    /// and rejects a missing path. Uses tempfile so nothing outside the test
-    /// tree is touched.
-    #[cfg(unix)]
-    #[test]
-    fn is_executable_respects_mode_bits() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let plain = dir.path().join("plain");
-        fs::write(&plain, b"#!/bin/sh\n").unwrap();
-        assert!(!is_executable(&plain));
-        fs::set_permissions(&plain, fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(is_executable(&plain));
-        assert!(!is_executable(&dir.path().join("missing")));
-    }
-
-    /// argv always contains the Forma-owned user-data-dir first (so a stray
-    /// later flag can't accidentally override it), every LAUNCH_FLAG, and
-    /// never `--remote-debugging-port`.
-    #[test]
-    fn argv_pins_user_data_dir_and_uses_pipe_never_port() {
-        let dir = PathBuf::from("/var/app-data/managed-chromium");
-        let argv = build_argv(&dir, Some("https://mail.google.com/"));
+    fn argv_is_headful_ephemeral_cdp_and_proxyless() {
+        let profile = PathBuf::from("/data/real-browser/profiles/default");
+        let argv = build_argv(&profile, Some("https://example.com/"));
         assert_eq!(
-            argv[0], "--user-data-dir=/var/app-data/managed-chromium",
-            "user-data-dir must be first so nothing overrides it"
+            argv[0],
+            "--user-data-dir=/data/real-browser/profiles/default",
+            "profile pin must be first so nothing overrides it"
         );
-        assert!(argv.iter().any(|a| a == "--remote-debugging-pipe"));
-        assert!(argv.iter().any(|a| a == "--disable-default-apps"));
+        assert!(argv.iter().any(|a| a == "--remote-debugging-port=0"));
         assert!(argv.iter().any(|a| a == "--no-first-run"));
         assert!(argv.iter().any(|a| a == "--no-default-browser-check"));
-        assert!(argv
-            .iter()
-            .any(|a| a == "--disable-features=ChromeWhatsNewUI"));
-        assert!(
-            !argv
-                .iter()
-                .any(|a| a.starts_with("--remote-debugging-port")),
-            "port-based CDP is a network attack surface and must never be enabled"
-        );
-        assert_eq!(argv.last().unwrap(), "https://mail.google.com/");
-    }
-
-    /// argv omits the trailing URL when none is requested.
-    #[test]
-    fn argv_omits_url_when_none() {
-        let argv = build_argv(&PathBuf::from("/x"), None);
-        assert!(!argv.iter().any(|a| a.starts_with("http")));
-    }
-
-    /// Blocked-URL config is exactly the Higgsfield wildcard, in the shape
-    /// CDP expects. Never returns any other host.
-    #[test]
-    fn blocked_urls_message_is_higgsfield_only() {
-        let msg = blocked_urls_message(7, "SID");
-        let value: serde_json::Value = serde_json::from_str(&msg).unwrap();
-        assert_eq!(value["id"], 7);
-        assert_eq!(value["method"], "Network.setBlockedURLs");
-        assert_eq!(value["sessionId"], "SID");
-        let urls = value["params"]["urls"].as_array().unwrap();
-        assert_eq!(urls.len(), 1);
-        assert_eq!(urls[0], "*higgsfield*");
-        // No other host is silently added.
-        for banned in ["mail.google.com", "example.com", "openai.com"] {
-            assert!(!msg.contains(banned));
+        for forbidden in ["--headless", "--proxy-server", "--proxy-pac-url", "--remote-debugging-pipe"] {
+            assert!(
+                !argv.iter().any(|a| a.starts_with(forbidden)),
+                "forbidden flag present: {forbidden}"
+            );
         }
+        assert_eq!(argv.last().unwrap(), "https://example.com/");
+        let bare = build_argv(&profile, None);
+        assert!(!bare.iter().any(|a| a.starts_with("http")));
     }
 
-    /// Frames are NUL-terminated and split back correctly, including on
-    /// concatenated buffers.
     #[test]
-    fn framing_is_nul_delimited() {
-        let a = frame("{\"id\":1}");
-        assert_eq!(*a.last().unwrap(), 0);
-        let mut combined = frame("{\"id\":1}");
-        combined.extend_from_slice(&frame("{\"id\":2}"));
-        let parts = split_frames(&combined);
-        assert_eq!(parts.len(), 2);
-        assert_eq!(std::str::from_utf8(parts[0]).unwrap(), "{\"id\":1}");
-        assert_eq!(std::str::from_utf8(parts[1]).unwrap(), "{\"id\":2}");
+    fn devtools_port_parses_first_line_only() {
+        assert_eq!(parse_devtools_port("39251\n/devtools/browser/abc"), Some(39251));
+        assert_eq!(parse_devtools_port("0\n"), None);
+        assert_eq!(parse_devtools_port("not-a-port"), None);
+        assert_eq!(parse_devtools_port(""), None);
     }
 
-    /// Stub transport that flushes queued replies whenever the code under
-    /// test writes a message; captures every write for later assertion.
-    struct StubTransport {
-        writes: Vec<String>,
-        replies: VecDeque<String>,
-    }
-    impl StubTransport {
-        fn new(replies: Vec<&str>) -> Self {
-            Self {
-                writes: Vec::new(),
-                replies: replies.into_iter().map(String::from).collect(),
-            }
+    #[test]
+    fn owned_paths_stay_inside_app_data() {
+        let app_data = Path::new("/tmp/appdata");
+        for path in [
+            install_root(app_data),
+            executable_path(app_data),
+            profile_dir(app_data),
+            zip_path(app_data),
+        ] {
+            assert!(path.starts_with("/tmp/appdata/real-browser"), "{path:?}");
         }
+        assert!(profile_dir(app_data).ends_with("profiles/default"));
+        assert!(install_root(app_data).ends_with("chromium-151"));
     }
-    impl CdpTransport for StubTransport {
-        fn write_message(&mut self, message: &str) -> std::io::Result<()> {
-            self.writes.push(message.to_string());
-            Ok(())
+
+    /// The CDP endpoint is only handed out when the browser runs AND the user
+    /// enabled assistant driving. Every other combination is an honest,
+    /// non-erroring "not available".
+    #[test]
+    fn session_payload_gates_on_running_and_enabled() {
+        let live = session_payload(Some(9222), true);
+        assert_eq!(live["available"], true);
+        assert_eq!(live["cdpEndpoint"], "http://127.0.0.1:9222");
+        for (port, enabled) in [(Some(9222), false), (None, false), (None, true)] {
+            let denied = session_payload(port, enabled);
+            assert_eq!(denied["available"], false, "{port:?} {enabled}");
+            assert!(denied.get("cdpEndpoint").is_none());
+            assert!(denied["detail"].as_str().unwrap().len() <= 200);
         }
-        fn read_message(&mut self) -> std::io::Result<Option<String>> {
-            Ok(self.replies.pop_front())
-        }
-    }
-
-    /// A successful handshake writes the Higgsfield block message, matches
-    /// the reply id, and returns Ok. The exact id is monotonic and starts at
-    /// 1 (fetch_add returns the pre-increment value).
-    #[test]
-    fn handshake_installs_higgsfield_block_and_matches_reply_id() {
-        let mut transport = StubTransport::new(vec![
-            "{\"method\":\"Target.attachedToTarget\",\"params\":{}}", // an event; ignored
-            "{\"id\":1,\"sessionId\":\"SID\",\"result\":{}}",
-        ]);
-        let ids = AtomicU64::new(1);
-        install_higgsfield_block(&mut transport, &ids, "SID").unwrap();
-        assert_eq!(transport.writes.len(), 1);
-        let sent: serde_json::Value = serde_json::from_str(&transport.writes[0]).unwrap();
-        assert_eq!(sent["id"], 1);
-        assert_eq!(sent["method"], "Network.setBlockedURLs");
-        assert_eq!(sent["params"]["urls"][0], "*higgsfield*");
-        assert_eq!(sent["sessionId"], "SID");
-        // Subsequent handshakes advance the id.
-        let mut transport =
-            StubTransport::new(vec!["{\"id\":2,\"sessionId\":\"SID\",\"result\":{}}"]);
-        install_higgsfield_block(&mut transport, &ids, "SID").unwrap();
-        let sent: serde_json::Value = serde_json::from_str(&transport.writes[0]).unwrap();
-        assert_eq!(sent["id"], 2);
-    }
-
-    /// A CDP `error` reply fails the handshake — we must not silently continue
-    /// launching Chromium without a Higgsfield block in place.
-    #[test]
-    fn handshake_fails_when_cdp_rejects_block() {
-        let mut transport = StubTransport::new(vec![
-            "{\"id\":9,\"sessionId\":\"SID\",\"error\":{\"code\":-32601,\"message\":\"unknown\"}}",
-        ]);
-        let ids = AtomicU64::new(9);
-        assert!(install_higgsfield_block(&mut transport, &ids, "SID").is_err());
-    }
-
-    /// The transport ending mid-handshake fails closed (never returns Ok
-    /// without a matched ack).
-    #[test]
-    fn handshake_fails_when_stream_ends() {
-        let mut transport = StubTransport::new(vec![]);
-        let ids = AtomicU64::new(1);
-        let err = install_higgsfield_block(&mut transport, &ids, "SID").unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
-    }
-
-    /// `user_data_root` composes safely and only under `<app_data>/`.
-    #[test]
-    fn user_data_root_lives_under_app_data() {
-        let root = user_data_root(Path::new("/tmp/appdata"));
-        assert!(root.starts_with("/tmp/appdata"));
-        assert!(root.ends_with("managed-chromium"));
-    }
-
-    /// `prepare_user_data_dir` creates a 0700 directory when missing, refuses
-    /// symlinked replacements, and never widens permissions on an existing
-    /// directory it accepts.
-    #[cfg(unix)]
-    #[test]
-    fn prepare_user_data_dir_creates_and_refuses_symlinks() {
-        use std::os::unix::fs::PermissionsExt;
-        let root = tempfile::tempdir().unwrap();
-        let dir = prepare_user_data_dir(root.path()).unwrap();
-        assert!(dir.is_dir());
+        // The disabled-toggle reason is reported even while running, so the
+        // model can honestly tell the user which switch to flip.
         assert_eq!(
-            fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
-            0o700
+            session_payload(Some(9222), false)["detail"],
+            "The user has not enabled assistant browser driving."
         );
-        // Idempotent when already present.
-        assert_eq!(prepare_user_data_dir(root.path()).unwrap(), dir);
-        // Relative paths refused.
-        assert!(prepare_user_data_dir(Path::new("relative")).is_err());
+    }
 
-        // Symlink at the target — never dereferenced into another dir.
-        let root = tempfile::tempdir().unwrap();
-        let elsewhere = tempfile::tempdir().unwrap();
-        std::os::unix::fs::symlink(elsewhere.path(), root.path().join("managed-chromium")).unwrap();
-        assert!(prepare_user_data_dir(root.path()).is_err());
+    /// Lifecycle transitions are generation-fenced: a stale monitor or a
+    /// stale failure cannot clobber a newer launch, and `live()` never
+    /// reports a non-running phase.
+    #[test]
+    fn lifecycle_is_generation_fenced_and_single_flight() {
+        let real = RealChromium::default();
+        let status = real.snapshot(None);
+        assert_eq!(status.phase, RealPhase::Idle);
+        assert!(!status.installed);
+        assert!(status.error.is_none());
+        assert!(real.live().is_none());
+
+        let first = real.begin().expect("first claim succeeds");
+        assert!(real.begin().is_none(), "single-flight while busy");
+        real.progress(first, RealPhase::Downloading, Some(40));
+        let status = real.snapshot(None);
+        assert_eq!(status.phase, RealPhase::Downloading);
+        assert_eq!(status.progress_percent, Some(40));
+        real.running(first, std::process::id(), 9222);
+        assert_eq!(real.live(), Some((std::process::id(), 9222)));
+
+        // A relaunch claims a new generation; the old exit monitor is inert.
+        let second = real.begin().expect("relaunch allowed after running");
+        real.exited(first);
+        assert_eq!(real.snapshot(None).phase, RealPhase::Running, "stale exit ignored");
+        real.failed(second, LAUNCH_FAILED);
+        let status = real.snapshot(None);
+        assert_eq!(status.phase, RealPhase::Error);
+        assert_eq!(status.error, Some(LAUNCH_FAILED));
+        assert!(real.live().is_none());
+        assert_eq!(real.generation(), second);
+    }
+
+    #[test]
+    fn exit_and_terminate_clear_the_session() {
+        let real = RealChromium::default();
+        let generation = real.begin().unwrap();
+        real.running(generation, std::process::id(), 9300);
+        real.exited(generation);
+        let status = real.snapshot(None);
+        assert_eq!(status.phase, RealPhase::Exited);
+        assert!(status.pid.is_none());
+        assert!(!status.cdp_ready);
+        assert!(real.live().is_none());
+        // Terminate on a non-running state is a no-op (nothing to signal).
+        real.terminate();
+        assert_eq!(real.snapshot(None).phase, RealPhase::Exited);
+    }
+
+    #[test]
+    fn status_serializes_camel_case_for_the_renderer() {
+        let real = RealChromium::default();
+        let json = serde_json::to_value(real.snapshot(None)).unwrap();
+        assert_eq!(json["phase"], "idle");
+        assert_eq!(json["cdpReady"], false);
+        assert_eq!(json["version"], CFT_VERSION);
+        assert!(json.get("progressPercent").is_some());
+        assert!(json.get("progress_percent").is_none());
     }
 }

@@ -556,8 +556,8 @@ export class AppStore {
       const current = this.snapshot.settings;
       if (!current) throw new AppError('not_ready', 'Settings are not ready.');
       const providerRevision = this.providerRevision;
-      const { onboardingComplete, onboardingStep, displayName, ambientMotion } = current;
-      const saved = await this.bridge.saveSettings({ onboardingComplete, onboardingStep, displayName, ambientMotion, ...patch });
+      const { onboardingComplete, onboardingStep, displayName, ambientMotion, assistantBrowserDrive } = current;
+      const saved = await this.bridge.saveSettings({ onboardingComplete, onboardingStep, displayName, ambientMotion, assistantBrowserDrive, ...patch });
       const settings = providerRevision === this.providerRevision ? saved : { ...saved, provider: this.snapshot.settings!.provider };
       this.emit({ settings });
       return settings;

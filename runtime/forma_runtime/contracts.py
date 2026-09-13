@@ -14,8 +14,9 @@ LIMITS = {"maxIterations": 8, "maxToolCalls": 12, "maxOutputTokens": 4096,
           "maxDurationSeconds": 180, "maxToolResultBytes": 262144}
 GOOGLE_TOOLS = ("forma_gmail_list_metadata", "forma_calendar_list_events")
 COMPOSIO_TOOLS = ("forma_list_connected_services", "forma_request_service_connection")
+BROWSER_TOOLS = ("forma_browser_session",)
 TOOLS = ("forma_interface_list", "forma_interface_get", "forma_interface_propose",
-         "forma_schedule_create", *GOOGLE_TOOLS, *COMPOSIO_TOOLS)
+         "forma_schedule_create", *GOOGLE_TOOLS, *COMPOSIO_TOOLS, *BROWSER_TOOLS)
 TERMINAL = frozenset(("succeeded", "failed", "cancelled", "interrupted", "blocked"))
 IDENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,79}$")
 FORBIDDEN_IDS = frozenset(("__proto__", "prototype", "constructor"))
@@ -455,6 +456,30 @@ def composio_result(data, request):
         require(data["status"] in CONNECTION_STATUS, "Invalid connection status")
         if "detail" in data: text(data["detail"], 200)
     require(len(canonical(data).encode()) <= 65536, "Tool result too large")
+    return data
+
+
+def browser_result(data, request):
+    """Native browser-session results: an availability flag and, only when the
+    host's user-controlled drive gate is open, a loopback CDP endpoint. Never
+    page content, account data, or a non-local address."""
+    require(request["toolName"] in BROWSER_TOOLS, "Wrong tool for browser result")
+    obj(data, ("kind", "available"), ("cdpEndpoint", "detail"))
+    require(data["kind"] == "browserSession", "Wrong result kind")
+    require(type(data["available"]) is bool, "Invalid availability flag")
+    if data["available"]:
+        require("cdpEndpoint" in data, "Available session needs its endpoint")
+    else:
+        require("cdpEndpoint" not in data, "Unavailable session must not leak an endpoint")
+    if "cdpEndpoint" in data:
+        endpoint = text(data["cdpEndpoint"], 200, 1)
+        url = urlsplit(endpoint)
+        require(url.scheme == "http" and url.hostname == "127.0.0.1" and url.port
+                and not url.username and not url.password and url.path in ("", "/")
+                and not url.query and not url.fragment, "Expected loopback CDP endpoint")
+    if "detail" in data:
+        text(data["detail"], 200)
+    require(len(canonical(data).encode()) <= 4096, "Tool result too large")
     return data
 
 

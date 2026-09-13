@@ -1,9 +1,13 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { ArrowLeft, ArrowRight, ArrowSquareOut, Browser, CalendarBlank, EnvelopeSimple, Globe, LockSimple, X } from '@phosphor-icons/react';
 import { IconButton, InlineError } from './components';
-import { defaultBrowserEngine, type BrowserEngine, type BrowserService } from './browser-contracts';
+import { defaultBrowserEngine, realChromiumStatusLine, type BrowserEngine, type BrowserService } from './browser-contracts';
 import type { OwnedBrowser } from './owned-browser';
 import './browser.css';
+
+const ENGINE_SHORT_LABEL: Record<BrowserEngine, string> = {
+  chromium: 'Chrome', scrapling: 'Scrapling', webkit: 'WebKit',
+};
 
 const services = [
   { id: 'gmail' as const, name: 'Gmail', detail: 'Mail', icon: EnvelopeSimple },
@@ -45,28 +49,32 @@ export function BrowserConnections({ browser, openWithEngine }: {
   </div>;
 }
 
-export function BrowserView({ browser }: { browser: OwnedBrowser }) {
+export function BrowserView({ browser, assistantDrive, onAssistantDrive }: {
+  browser: OwnedBrowser;
+  /** "Assistant may drive the browser" preference (default off). */
+  assistantDrive: boolean;
+  onAssistantDrive: (enabled: boolean) => void;
+}) {
   const [address, setAddress] = useState('');
   const editing = useRef(false);
   const open = browser.status.phase === 'open';
   const enabled = browser.native && browser.status.available && !browser.busy;
   useEffect(() => { if (!editing.current) setAddress(browser.status.url || ''); }, [browser.status.url]);
 
-  // Engine toggle. Only rendered when the host actually advertises more than
+  // Engine picker. Only rendered when the host actually advertises more than
   // one engine — a single engine has nothing to toggle to. The default choice
-  // is the host's advertised default (Scrapling first when its sealed
-  // resources verify; WebKit otherwise) — never a silent swap.
+  // is the host's advertised default (the real Chrome once installed, then
+  // Scrapling when its sealed resources verify, then WebKit) — never a
+  // silent swap.
   const engines = useMemo(() => browser.status.availableEngines ?? [], [browser.status.availableEngines]);
   const hostDefault = useMemo(() => defaultBrowserEngine(engines), [engines]);
-  const scrapling = engines.find(engine => engine.id === 'scrapling');
-  const webkit = engines.find(engine => engine.id === 'webkit');
-  const showToggle = !!webkit && !!scrapling;
-  const [engineChoice, setEngineChoice] = useState<BrowserEngine>(hostDefault === 'scrapling' ? 'scrapling' : 'webkit');
+  const showToggle = engines.length > 1;
+  const [engineChoice, setEngineChoice] = useState<BrowserEngine>(hostDefault === 'unavailable' ? 'webkit' : hostDefault);
   useEffect(() => {
     // If the host stops advertising the chosen engine, fall back to the
     // advertised default rather than leaving the toggle on something gone.
-    if (!engines.some(engine => engine.id === engineChoice)) {
-      setEngineChoice(hostDefault === 'scrapling' ? 'scrapling' : 'webkit');
+    if (engines.length && !engines.some(engine => engine.id === engineChoice)) {
+      setEngineChoice(hostDefault === 'unavailable' ? 'webkit' : hostDefault);
     }
   }, [engines, hostDefault, engineChoice]);
 
@@ -77,6 +85,13 @@ export function BrowserView({ browser }: { browser: OwnedBrowser }) {
   // Scrapling sessions render fetched snapshots in the browser window: honest
   // read-only and fetching states, never a pretend-live page.
   const scraplingOpen = browser.status.engine === 'scrapling' && open;
+  // Real Chrome: its own window IS the browser; Forma shows an honest status
+  // card (install progress, pid, CDP link) instead of pretending to embed it.
+  const real = browser.status.realChromium;
+  const chromiumAdvertised = engines.some(engine => engine.id === 'chromium');
+  const realSelected = chromiumAdvertised && engineChoice === 'chromium';
+  const realRunning = real.phase === 'running';
+  const realBusy = real.phase === 'downloading' || real.phase === 'extracting' || real.phase === 'verifying' || real.phase === 'launching';
 
   return <section className="browser-page" aria-labelledby="browser-title">
     <header className="browser-heading">
@@ -108,18 +123,33 @@ export function BrowserView({ browser }: { browser: OwnedBrowser }) {
       <div className="browser-window-preview" aria-hidden="true"><div className="browser-preview-chrome"><i /><i /><i /><span /></div><div className="browser-preview-content"><Browser size={44} weight="light" /><span>Your own browsing space</span></div></div>
       <div className="browser-home-copy"><h2>{open ? 'Your browser is open' : 'Sign in once. Keep your sessions.'}</h2>
         <p>{open ? 'Continue in the Forma browser window, or open another service below.' : 'Forma uses its own browser profile. It does not copy the sessions from your normal browser.'}</p>
-        {showToggle && scrapling && (
+        {showToggle && (
           <div className="browser-engine-toggle" role="radiogroup" aria-label="Browser engine">
-            <button type="button" role="radio" aria-checked={engineChoice === 'scrapling'} className={`browser-engine-option${engineChoice === 'scrapling' ? ' selected' : ''}`} onClick={() => setEngineChoice('scrapling')} disabled={!enabled || open}>Scrapling</button>
-            <button type="button" role="radio" aria-checked={engineChoice === 'webkit'} className={`browser-engine-option${engineChoice === 'webkit' ? ' selected' : ''}`} onClick={() => setEngineChoice('webkit')} disabled={!enabled || open}>WebKit</button>
+            {engines.map(engine => (
+              <button key={engine.id} type="button" role="radio" aria-checked={engineChoice === engine.id} className={`browser-engine-option${engineChoice === engine.id ? ' selected' : ''}`} onClick={() => setEngineChoice(engine.id)} disabled={!enabled || open}>{ENGINE_SHORT_LABEL[engine.id] ?? engine.label}</button>
+            ))}
           </div>
         )}
-        <button type="button" className="button primary" disabled={!enabled} onClick={() => { void openWithEngine('home'); }}>{browser.busy ? 'Opening…' : open ? 'Show browser' : 'Open browser'} <ArrowSquareOut size={17} /></button>
+        <button type="button" className="button primary" disabled={!enabled} onClick={() => { void openWithEngine('home'); }}>{browser.busy ? 'Opening…' : (realSelected ? realRunning : open) ? 'Show browser' : 'Open browser'} <ArrowSquareOut size={17} /></button>
         {(open || browser.status.phase === 'opening') && <button type="button" className="text-button muted" onClick={() => { void browser.close(); }} disabled={browser.actionPending}><X size={15} />{open ? 'Close window' : 'Cancel opening'}</button>}
       </div>
     </div>
+    {chromiumAdvertised && (realSelected || real.phase !== 'idle') && (
+      <section className="browser-real-card" aria-labelledby="browser-real-title">
+        <h2 id="browser-real-title">Chrome (full browser)</h2>
+        <p className="field-note" role="status">{realChromiumStatusLine(real)}</p>
+        {realBusy && real.phase === 'downloading' && (
+          <progress max={100} value={real.progressPercent ?? 0} aria-label="Chrome download progress" />
+        )}
+        <p className="field-note">Sign in to your accounts here; the assistant can drive this browser when you ask. It opens as a real Chrome window with its own tabs, kept separate from your other browsers.</p>
+        <label className="toggle-field">
+          <span>Assistant may drive the browser<span className="row-detail">Off by default. When on, the assistant can control this Chrome while it is open.</span></span>
+          <input type="checkbox" role="switch" checked={assistantDrive} onChange={event => onAssistantDrive(event.target.checked)} />
+        </label>
+      </section>
+    )}
     <section className="browser-service-section" aria-labelledby="browser-services-title"><h2 id="browser-services-title">Browse websites</h2><BrowserConnections browser={browser} openWithEngine={openWithEngine} /></section>
     {browser.status.chromiumUnavailableReason && <p className="field-note">{browser.status.chromiumUnavailableReason}</p>}
-    <details className="browser-details"><summary><LockSimple size={16} />About this browser</summary><p>Closing the window keeps its site sessions on this device. API access requires each service’s supported authorization; signing in does not create API keys. Browser automation is not connected to the agent yet.</p><p>Some services require sign-in through a supported external browser. Forma will not bypass their login requirements.</p></details>
+    <details className="browser-details"><summary><LockSimple size={16} />About this browser</summary><p>Closing the window keeps its site sessions on this device. API access requires each service’s supported authorization; signing in does not create API keys. The assistant can drive only the full Chrome browser, only while it is open and the “Assistant may drive the browser” switch is on.</p><p>Some services require sign-in through a supported external browser. Forma will not bypass their login requirements.</p></details>
   </section>;
 }

@@ -10,7 +10,7 @@ const emptyProvider = (): ProviderConfig => ({
 });
 const defaultSettings = (): AppSettings => ({
   schemaVersion: 1, onboardingComplete: false, onboardingStep: 0,
-  displayName: '', ambientMotion: true, provider: emptyProvider(),
+  displayName: '', ambientMotion: true, assistantBrowserDrive: false, provider: emptyProvider(),
 });
 export const summaryOf = ({ id, title, createdAt, updatedAt, messageCount }: ChatWorkspace): WorkspaceSummary =>
   ({ id, title, createdAt, updatedAt, messageCount });
@@ -73,11 +73,11 @@ function validWorkspace(value: unknown): value is ChatWorkspace {
     Array.isArray(value.messages) && value.messages.every(validMessage) && value.messageCount === value.messages.length;
 }
 function validSettings(value: unknown): value is AppSettings {
-  if (!record(value) || !exactKeys(value, ['schemaVersion', 'onboardingComplete', 'onboardingStep', 'displayName', 'ambientMotion', 'provider'])) return false;
+  if (!record(value) || !exactKeys(value, ['schemaVersion', 'onboardingComplete', 'onboardingStep', 'displayName', 'ambientMotion', 'assistantBrowserDrive', 'provider'])) return false;
   const provider = value.provider;
   return value.schemaVersion === 1 && typeof value.onboardingComplete === 'boolean' &&
     integer(value.onboardingStep) && value.onboardingStep <= 2 && text(value.displayName, 80) &&
-    typeof value.ambientMotion === 'boolean' && record(provider) &&
+    typeof value.ambientMotion === 'boolean' && typeof value.assistantBrowserDrive === 'boolean' && record(provider) &&
     exactKeys(provider, ['label', 'baseUrl', 'model', 'hasKey', 'verified', 'lastCheckedAt']) &&
     provider.label === '' && provider.baseUrl === '' && provider.model === '' && provider.hasKey === false &&
     provider.verified === false && provider.lastCheckedAt === null;

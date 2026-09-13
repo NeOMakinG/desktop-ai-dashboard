@@ -39,6 +39,8 @@ export interface AppSettings {
   onboardingStep: number;
   displayName: string;
   ambientMotion: boolean;
+  /** "Assistant may drive the browser" — gates the CDP hand-off. Default off. */
+  assistantBrowserDrive: boolean;
   provider: ProviderConfig;
 }
 
@@ -47,6 +49,7 @@ export interface SettingsInput {
   onboardingStep: number;
   displayName: string;
   ambientMotion: boolean;
+  assistantBrowserDrive: boolean;
 }
 
 export interface ProviderInput {

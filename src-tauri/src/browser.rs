@@ -1,8 +1,12 @@
 //! App-owned browsing, deliberately separate from the privileged renderer.
 //!
-//! WebKit on macOS 14+ is the only available engine. Chromium requests fail
-//! closed before binary detection, profile access, pipe setup or process spawn:
-//! post-launch CDP filters cannot prove startup/restoration/background denial.
+//! Three engines, labeled honestly:
+//! * "chromium" — the REAL, headful Chrome-for-Testing browser (founder
+//!   directive 2026-09-13): the user browses and signs in directly, sessions
+//!   persist, and the assistant may drive it over loopback CDP only behind
+//!   an explicit default-off preference. See `chromium.rs`.
+//! * "scrapling" — read-only snapshot engine behind the egress relay.
+//! * "webkit" — the isolated WebKit window on macOS 14+.
 
 mod chromium;
 pub(crate) mod engine;
@@ -80,13 +84,34 @@ pub struct AvailableEngine {
 
 /// Compute the engines available on this host. Ordered: default first.
 ///
-/// Never spawns anything or inspects Chromium installations/profiles. Windows
-/// and Linux remain unavailable rather than advertising an unsupported runtime.
+/// Founder directive 2026-09-13: the REAL Chrome browser is the default once
+/// its pinned binary is installed; before that first-use download it is still
+/// advertised (last), so the picker can offer it honestly. Scrapling stays
+/// available as the secondary snapshot engine; WebKit remains the fallback.
+/// Windows and Linux remain unavailable rather than advertising an
+/// unsupported runtime.
 pub fn browser_engines(app: Option<&AppHandle>) -> Vec<AvailableEngine> {
+    let app_data = app.and_then(|app| app.path().app_data_dir().ok());
+    browser_engines_with(app, app_data.as_deref())
+}
+
+fn browser_engines_with(
+    app: Option<&AppHandle>,
+    app_data: Option<&std::path::Path>,
+) -> Vec<AvailableEngine> {
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    let _ = app_data;
     let mut engines: Vec<AvailableEngine> = Vec::new();
-    // Founder directive 2026-09-13: the integrated browser is Scrapling. It is
-    // advertised first (and used as the default) only when the sealed managed
-    // browser resource is present; otherwise WebKit remains, visibly.
+    let chromium_supported = chromium::supported();
+    let chromium_installed =
+        chromium_supported && app_data.map(chromium::installed).unwrap_or(false);
+    let chromium_engine = AvailableEngine {
+        id: chromium::ENGINE_ID,
+        label: chromium::ENGINE_LABEL,
+    };
+    if chromium_installed {
+        engines.push(chromium_engine.clone());
+    }
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     if app.is_some_and(engine::advertised) {
         engines.push(AvailableEngine {
@@ -94,12 +119,17 @@ pub fn browser_engines(app: Option<&AppHandle>) -> Vec<AvailableEngine> {
             label: "Scrapling (Chromium snapshots)",
         });
     }
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    let _ = app;
     #[cfg(target_os = "macos")]
     if macos::supported() {
         engines.push(AvailableEngine {
             id: "webkit",
             label: "WebKit",
         });
+    }
+    if chromium_supported && !chromium_installed {
+        engines.push(chromium_engine);
     }
     engines
 }
@@ -134,7 +164,9 @@ pub struct OwnedBrowserStatus {
     engine: &'static str,
     /// Every engine the host supports right now (empty on unsupported hosts).
     available_engines: Vec<AvailableEngine>,
-    chromium_unavailable_reason: &'static str,
+    chromium_unavailable_reason: Option<&'static str>,
+    /// Real Chrome lifecycle (install/launch/run) for the status card.
+    real_chromium: chromium::RealChromiumStatus,
     persistent: bool,
     profile_id: Option<String>,
     url: Option<String>,
@@ -162,11 +194,13 @@ pub struct BrowserState {
     allow_loopback: bool,
     engine: Arc<Mutex<Option<engine::EngineRuntime>>>,
     pub(crate) snapshots: engine::SharedSnapshots,
+    pub(crate) real: Arc<chromium::RealChromium>,
 }
 
 impl BrowserState {
     pub fn new(directory: Option<PathBuf>, qa_override: bool, app: Option<&AppHandle>) -> Self {
-        let engines = browser_engines(app);
+        let real = Arc::new(chromium::RealChromium::default());
+        let engines = browser_engines_with(app, directory.as_deref());
         let available = !engines.is_empty();
         // Default engine identifier when nothing is running yet — matches the
         // engine `browser_open` will pick when the caller omits `engine`.
@@ -183,7 +217,9 @@ impl BrowserState {
                     },
                     engine: default_engine,
                     available_engines: engines,
-                    chromium_unavailable_reason: chromium::UNAVAILABLE_REASON,
+                    chromium_unavailable_reason: (!chromium::supported())
+                        .then_some(chromium::PLATFORM_UNAVAILABLE),
+                    real_chromium: real.snapshot(directory.as_deref()),
                     persistent: false,
                     profile_id: None,
                     url: None,
@@ -201,6 +237,7 @@ impl BrowserState {
             allow_loopback: cfg!(debug_assertions) && qa_override,
             engine: Arc::new(Mutex::new(None)),
             snapshots: Arc::new(Mutex::new(engine::SnapshotStore::default())),
+            real,
         }
     }
 
@@ -233,6 +270,9 @@ impl BrowserState {
     }
 
     pub fn shutdown(&self) {
+        // Reap the real Chrome child on app quit: the browser never outlives
+        // Forma. SIGTERM lets Chrome persist the profile (sessions survive).
+        self.real.terminate();
         if let Ok(generation) = self.lock().map(|s| s.generation) {
             self.closed(generation, false);
         }
@@ -245,8 +285,15 @@ impl BrowserState {
     }
 
     fn status(&self) -> AppResult<OwnedBrowserStatus> {
+        // Refresh live host facts outside the session lock: the engine list
+        // changes once the real browser installs, and the real-browser card
+        // must track download/launch/run transitions.
+        let engines = browser_engines_with(self.app.as_ref(), self.directory.as_deref());
+        let real = self.real.snapshot(self.directory.as_deref());
         let mut session = self.lock()?;
         session.status.revision = session.status.revision.saturating_add(1);
+        session.status.available_engines = engines;
+        session.status.real_chromium = real;
         Ok(session.status.clone())
     }
 
@@ -500,26 +547,24 @@ enum Action {
 }
 
 /// Resolve the engine requested by the caller against what the host actually
-/// supports. The default is the first advertised engine — Scrapling when its
-/// sealed resources verify (founder directive 2026-09-13), WebKit otherwise.
-/// The fallback is visible in the engine list, never a silent swap; explicit
-/// Chromium requests remain unavailable.
+/// supports. The default is the first advertised engine — the real Chrome
+/// once its pinned binary is installed, Scrapling when its sealed resources
+/// verify, WebKit otherwise. The fallback is visible in the engine list,
+/// never a silent swap.
 fn resolve_engine(
     request: Option<BrowserEngine>,
     advertised: &[AvailableEngine],
 ) -> AppResult<BrowserEngine> {
     let engines = advertised;
-    let default = match engines.first() {
-        Some(engine) if engine.id == ENGINE_SCRAPLING => BrowserEngine::Scrapling,
+    let default = match engines.first().map(|engine| engine.id) {
+        Some(id) if id == ENGINE_SCRAPLING => BrowserEngine::Scrapling,
+        Some(id) if id == chromium::ENGINE_ID => BrowserEngine::Chromium,
         _ => BrowserEngine::Webkit,
     };
     let want = request.unwrap_or(default);
-    if want == BrowserEngine::Chromium {
-        chromium::require_available()?;
-    }
     let wanted_id = match want {
         BrowserEngine::Webkit => "webkit",
-        BrowserEngine::Chromium => "chromium",
+        BrowserEngine::Chromium => chromium::ENGINE_ID,
         BrowserEngine::Scrapling => ENGINE_SCRAPLING,
     };
     if engines.iter().any(|e| e.id == wanted_id) {
@@ -747,6 +792,170 @@ async fn open_scrapling(
     state.status()
 }
 
+/// Open (installing on first use) the REAL Chrome browser. The Chrome window
+/// itself is the UI — real tabs, real omnibox, real sign-ins. Forma only
+/// shows a status card. App-supplied destinations still pass the URL gate;
+/// what the user then types into Chrome's own omnibox is their own browsing,
+/// exactly like Safari.
+async fn open_real_chromium(
+    state: BrowserState,
+    service: BrowserService,
+    raw: Option<String>,
+) -> AppResult<OwnedBrowserStatus> {
+    if !chromium::supported() {
+        return Err(AppError::new(
+            "browser_unavailable",
+            chromium::PLATFORM_UNAVAILABLE,
+        ));
+    }
+    let app_data = state
+        .directory
+        .clone()
+        .ok_or_else(|| AppError::new("browser_unavailable", GATE_ERROR))?;
+    let target: Option<String> = match (service, raw.as_deref()) {
+        (BrowserService::Home, None) => None,
+        (BrowserService::Custom, Some(raw)) => Some(state.validate_url(raw)?.to_string()),
+        _ => {
+            let url = service_url(service, raw.as_deref(), state.allow_loopback)?;
+            (url.as_str() != "about:blank").then(|| url.to_string())
+        }
+    };
+    // Focus path: a live Chrome owns the profile lock; spawning the binary
+    // again forwards to that instance (focus / new tab) and exits itself.
+    if state.real.live().is_some() {
+        let mut command =
+            tokio::process::Command::new(chromium::executable_path(&app_data));
+        command
+            .args(chromium::build_argv(
+                &chromium::profile_dir(&app_data),
+                target.as_deref(),
+            ))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let _ = command.spawn();
+        state.emit();
+        return state.status();
+    }
+    let generation = state.real.begin().ok_or_else(|| {
+        AppError::new(
+            "browser_busy",
+            "The browser is still being prepared. Try again shortly.",
+        )
+    })?;
+    match real_install_and_launch(&state, &app_data, generation, target.as_deref()).await {
+        Ok(()) => {
+            state.emit();
+            state.status()
+        }
+        Err(error) => {
+            state.real.failed(generation, error.message);
+            state.emit();
+            Err(error)
+        }
+    }
+}
+
+async fn real_install_and_launch(
+    state: &BrowserState,
+    app_data: &std::path::Path,
+    generation: u64,
+    target: Option<&str>,
+) -> AppResult<()> {
+    use chromium::RealPhase;
+    if !chromium::installed(app_data) {
+        state
+            .real
+            .progress(generation, RealPhase::Downloading, Some(0));
+        state.emit();
+        let progress = state.clone();
+        let zip = chromium::download_zip(app_data, move |percent| {
+            progress
+                .real
+                .progress(generation, RealPhase::Downloading, Some(percent));
+            progress.emit();
+        })
+        .await?;
+        state.real.progress(generation, RealPhase::Extracting, None);
+        state.emit();
+        chromium::extract_zip(app_data, &zip).await?;
+        // The verified install is cached forever; the archive is not.
+        let _ = std::fs::remove_file(&zip);
+    }
+    state.real.progress(generation, RealPhase::Verifying, None);
+    state.emit();
+    let binary = chromium::verify_binary(app_data).await?;
+    state.real.progress(generation, RealPhase::Launching, None);
+    state.emit();
+    let profile = chromium::profile_dir(app_data);
+    std::fs::create_dir_all(&profile).map_err(|_| AppError::storage())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&profile, std::fs::Permissions::from_mode(0o700));
+    }
+    // Stale marker from a previous run must not be mistaken for a live CDP.
+    let _ = std::fs::remove_file(profile.join("DevToolsActivePort"));
+    let mut command = tokio::process::Command::new(&binary);
+    command
+        .args(chromium::build_argv(&profile, target))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        // The browser may outlive a chat; it is reaped on app quit through
+        // BrowserState::shutdown, never silently on handle drop.
+        .kill_on_drop(false);
+    let mut child = command
+        .spawn()
+        .map_err(|_| AppError::new("browser_unavailable", chromium::LAUNCH_FAILED))?;
+    let pid = child
+        .id()
+        .ok_or_else(|| AppError::new("browser_unavailable", chromium::LAUNCH_FAILED))?;
+    let port = match chromium::await_cdp(&profile, std::time::Duration::from_secs(90)).await {
+        Ok(port) => port,
+        Err(error) => {
+            let _ = child.start_kill();
+            return Err(error);
+        }
+    };
+    state.real.running(generation, pid, port);
+    // Exit monitor (generation-fenced): the user quitting Chrome themselves
+    // is an honest "exited" state, never a pretend-running card.
+    let monitor = state.clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = child.wait().await;
+        monitor.real.exited(generation);
+        monitor.emit();
+    });
+    Ok(())
+}
+
+/// The `forma_browser_session` runtime tool name (wired in runtime/runs.rs).
+pub const RUNTIME_BROWSER_SESSION_TOOL: &str = "forma_browser_session";
+
+/// Host gate for `forma_browser_session`: the loopback CDP endpoint is
+/// revealed to the managed runtime ONLY while the real browser is running
+/// AND the user's "assistant may drive the browser" preference (default OFF)
+/// is enabled. Every other combination is an honest non-error unavailable.
+pub fn runtime_browser_session(app: &AppHandle) -> AppResult<serde_json::Value> {
+    let port = app
+        .try_state::<BrowserState>()
+        .and_then(|state| state.real.live())
+        .map(|(_, port)| port);
+    let enabled = app
+        .try_state::<crate::core::NativeState>()
+        .and_then(|state| {
+            state.lock().ok().map(|core| {
+                core.store
+                    .settings()
+                    .map(|settings| settings.preferences.assistant_browser_drive)
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false);
+    Ok(chromium::session_payload(port, enabled))
+}
+
 async fn perform(
     app: AppHandle,
     state: BrowserState,
@@ -794,6 +1003,11 @@ async fn perform(
     }
     if let Action::Open(service, raw, BrowserEngine::Scrapling) = &action {
         return open_scrapling(app.clone(), state.clone(), *service, raw.clone()).await;
+    }
+    if let Action::Open(service, raw, BrowserEngine::Chromium) = &action {
+        // Real Chrome runs as its own app-owned process; never on the main
+        // thread and never through the WebKit window state machine.
+        return open_real_chromium(state.clone(), *service, raw.clone()).await;
     }
     if let Action::Navigate(raw) = &action {
         if state
@@ -915,12 +1129,9 @@ fn perform_on_main(
                         });
                     }
                 }
-                BrowserEngine::Chromium => {
-                    open_chromium(state, service, url)?;
-                }
-                BrowserEngine::Scrapling => {
+                BrowserEngine::Chromium | BrowserEngine::Scrapling => {
                     // Handled asynchronously in `perform`; the main thread
-                    // never blocks on engine startup or page fetches.
+                    // never blocks on downloads, engine startup or fetches.
                     return Err(AppError::new("browser_unavailable", GATE_ERROR));
                 }
             }
@@ -949,15 +1160,7 @@ fn perform_on_main(
     state.status()
 }
 
-/// Fail closed before profile access or starting any child, on every platform.
-fn open_chromium(_state: &BrowserState, _service: BrowserService, _target: Url) -> AppResult<()> {
-    chromium::require_available()
-}
-
 fn secured_window(app: &AppHandle, state: &BrowserState) -> AppResult<WebviewWindow> {
-    if state.lock()?.status.engine == "chromium" {
-        chromium::require_available()?;
-    }
     if !state.lock()?.secured {
         return Err(AppError::new(
             "browser_closed",
@@ -988,10 +1191,8 @@ pub async fn browser_open(
     engine: Option<BrowserEngine>,
 ) -> AppResult<OwnedBrowserStatus> {
     crate::first_party(&window)?;
-    let advertised = state
-        .lock()
-        .map(|s| s.status.available_engines.clone())
-        .unwrap_or_default();
+    // Recompute live: the engine list changes once the real browser installs.
+    let advertised = browser_engines_with(state.app.as_ref(), state.directory.as_deref());
     let engine = resolve_engine(engine, &advertised)?;
     perform(
         app,
@@ -1239,18 +1440,14 @@ mod tests {
         }
     }
 
+    /// Real Chrome resolves only when advertised and never mutates the
+    /// WebKit session machine merely by being requested. On unsupported
+    /// hosts it stays fail-closed with an honest reason.
     #[test]
-    fn chromium_cannot_start_or_mutate_an_existing_session() {
+    fn chromium_resolution_is_advertised_only_and_side_effect_free() {
         let state = BrowserState::new(None, false, None);
         let before = state.status().unwrap();
-        let error = open_chromium(
-            &state,
-            BrowserService::Home,
-            Url::parse("about:blank").unwrap(),
-        )
-        .unwrap_err();
-        assert_eq!(error.code, "browser_unavailable");
-        assert_eq!(error.message, chromium::UNAVAILABLE_REASON);
+        // Not advertised → fail closed, no silent fallback.
         assert_eq!(
             resolve_engine(
                 Some(BrowserEngine::Chromium),
@@ -1260,21 +1457,41 @@ mod tests {
                 }]
             )
             .unwrap_err()
-            .message,
-            chromium::UNAVAILABLE_REASON
+            .code,
+            "browser_unavailable"
+        );
+        // Advertised → resolves, and defaults to Chromium when first.
+        let engines = [
+            AvailableEngine {
+                id: chromium::ENGINE_ID,
+                label: chromium::ENGINE_LABEL,
+            },
+            AvailableEngine {
+                id: "webkit",
+                label: "WebKit",
+            },
+        ];
+        assert_eq!(
+            resolve_engine(Some(BrowserEngine::Chromium), &engines).unwrap(),
+            BrowserEngine::Chromium
+        );
+        assert_eq!(
+            resolve_engine(None, &engines).unwrap(),
+            BrowserEngine::Chromium,
+            "installed real Chrome is the default engine"
         );
         let after = state.status().unwrap();
         assert_eq!(after.phase, before.phase);
         assert_eq!(after.engine, before.engine);
         assert_eq!(after.persistent, before.persistent);
-        assert!(!after
-            .available_engines
-            .iter()
-            .any(|engine| engine.id == "chromium"));
-        assert_eq!(
-            after.chromium_unavailable_reason,
-            chromium::UNAVAILABLE_REASON
-        );
+        // The real-browser card starts idle with the drive path closed.
+        assert_eq!(after.real_chromium.pid, None);
+        assert!(!after.real_chromium.cdp_ready);
+        // Platform support and the unavailable reason are mutually exclusive.
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        assert_eq!(after.chromium_unavailable_reason, None);
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        assert!(after.chromium_unavailable_reason.is_some());
     }
 
     #[test]
@@ -1362,11 +1579,18 @@ mod tests {
             let webkit = engines.iter().find(|e| e["id"] == "webkit").unwrap();
             assert_eq!(webkit["label"], "WebKit");
         }
-        // Never advertise an engine that is not "webkit" or "chromium".
+        // Never advertise an engine outside the honest, known set.
         for engine in engines {
             let id = engine["id"].as_str().unwrap();
-            assert!(id == "webkit" || id == "chromium", "unexpected id: {id}");
+            assert!(
+                id == "webkit" || id == "chromium" || id == ENGINE_SCRAPLING,
+                "unexpected id: {id}"
+            );
         }
+        // Real-browser card and drive gate ship camelCase and default-closed.
+        assert_eq!(json["realChromium"]["phase"], "idle");
+        assert_eq!(json["realChromium"]["cdpReady"], false);
+        assert!(json.get("real_chromium").is_none());
     }
 
     /// `resolve_engine(None)` defaults to WebKit when WebKit is available.
@@ -1404,21 +1628,27 @@ mod tests {
     }
 
     /// `browser_engines()` never lies: every reported engine has a truthful
-    /// human label and a snake_case id the frontend can key off.
+    /// human label and a snake_case id the frontend can key off. Real Chrome
+    /// is only the FIRST (default) entry once its binary is installed.
     #[test]
     fn browser_engines_labels_are_truthful() {
-        for engine in browser_engines(None) {
+        let engines = browser_engines(None);
+        for engine in &engines {
             match engine.id {
                 "webkit" => assert_eq!(engine.label, "WebKit"),
-                "chromium" => assert!(
-                    engine.label == "System Chrome"
-                        || engine.label == "Chrome Canary"
-                        || engine.label == "Chromium",
-                    "unexpected chromium label: {}",
-                    engine.label
-                ),
+                "chromium" => assert_eq!(engine.label, chromium::ENGINE_LABEL),
+                ENGINE_SCRAPLING => {
+                    assert_eq!(engine.label, "Scrapling (Chromium snapshots)")
+                }
                 other => panic!("unexpected engine id: {other}"),
             }
+        }
+        // Without an installed binary the real browser never claims default.
+        if chromium::supported() {
+            let uninstalled =
+                browser_engines_with(None, Some(std::path::Path::new("/nonexistent")));
+            assert_eq!(uninstalled.last().map(|e| e.id), Some("chromium"));
+            assert_ne!(uninstalled.first().map(|e| e.id), Some("chromium"));
         }
     }
 

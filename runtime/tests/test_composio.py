@@ -95,7 +95,9 @@ class ComposioContractCase(unittest.TestCase):
         self.assertIn(COMPOSIO_TOOLS[0], TOOLS)
         self.assertIn(COMPOSIO_TOOLS[1], TOOLS)
         self.assertEqual(TOOLS.count(COMPOSIO_TOOLS[0]), 1)
-        self.assertEqual(len(TOOLS), 8)
+        # 9 = 4 core + 2 google + 2 composio + 1 browser session (2026-09-13).
+        self.assertEqual(len(TOOLS), 9)
+        self.assertIn("forma_browser_session", TOOLS)
         # A google tool result must still be validated by google_result.
         request = {"toolName": GOOGLE_TOOLS[1], "args": {"startAt": "2026-09-10T00:00:00Z",
                                                          "endAt": "2026-09-11T00:00:00Z", "maxItems": 1}}

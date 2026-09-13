@@ -28,6 +28,11 @@
 .browser-engine-option.selected { background:var(--panel); color:var(--ink); }
 .browser-engine-option:disabled { cursor:not-allowed; opacity:.5; }
 .browser-engine-option:focus-visible { outline:2px solid var(--focus-border); outline-offset:2px; }
+.browser-real-card { display:flex; flex-direction:column; gap:12px; max-width:1000px; margin:0 auto 32px; padding:24px; border:1px solid var(--border); border-radius:20px; background:var(--panel); }
+.browser-real-card h2 { margin:0; font-size:18px; font-weight:550; }
+.browser-real-card progress { width:100%; accent-color:var(--focus-border); }
+.browser-real-card .toggle-field { display:flex; align-items:center; justify-content:space-between; gap:16px; padding:12px 16px; border:1px solid var(--border); border-radius:8px; font-size:13px; }
+.browser-real-card .toggle-field .row-detail { margin-top:2px; }
 .browser-service-section { max-width:1000px; margin:0 auto; }
 .browser-service-section h2 { margin:0 0 16px; font-size:18px; font-weight:550; }
 .browser-connections { display:flex; flex-direction:column; gap:12px; }

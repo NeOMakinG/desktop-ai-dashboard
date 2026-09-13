@@ -43,6 +43,11 @@ pub struct SettingsInput {
     pub onboarding_step: u8,
     pub display_name: String,
     pub ambient_motion: bool,
+    /// "Assistant may drive the browser": gates the forma_browser_session
+    /// CDP hand-off. Defaults OFF, including for preferences stored before
+    /// this field existed (serde default keeps old rows decodable).
+    #[serde(default)]
+    pub assistant_browser_drive: bool,
 }
 impl Default for SettingsInput {
     fn default() -> Self {
@@ -51,6 +56,7 @@ impl Default for SettingsInput {
             onboarding_step: 0,
             display_name: String::new(),
             ambient_motion: true,
+            assistant_browser_drive: false,
         }
     }
 }

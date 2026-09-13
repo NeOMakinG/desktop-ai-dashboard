@@ -1,6 +1,6 @@
 import { strict as assert } from 'node:assert';
 import { readFileSync } from 'node:fs';
-import { acceptsBrowserRevision, browserActionFailure, defaultBrowserEngine, type AvailableBrowserEngine, type OwnedBrowserStatus } from './browser-contracts.ts';
+import { acceptsBrowserRevision, browserActionFailure, defaultBrowserEngine, realChromiumStatusLine, type AvailableBrowserEngine, type OwnedBrowserStatus, type RealChromiumStatus } from './browser-contracts.ts';
 
 export function runBrowserRegressionChecks() {
   assert.equal(acceptsBrowserRevision(-1, 0), true);
@@ -15,10 +15,15 @@ export function runBrowserRegressionChecks() {
   apply({ revision: 3, phase: 'closed' });
   apply({ revision: 2, phase: 'open' });
   assert.deepEqual(state, { revision: 3, phase: 'closed' });
+  const idleReal: RealChromiumStatus = {
+    supported: true, installed: false, phase: 'idle', progressPercent: null,
+    pid: null, cdpReady: false, error: null, version: '151.0.7922.34',
+  };
   const status: OwnedBrowserStatus = {
     revision: 4, available: true, phase: 'closed', engine: 'webkit',
     availableEngines: [{ id: 'webkit', label: 'WebKit' }],
-    chromiumUnavailableReason: 'Chromium is unavailable until startup protection is proven.',
+    chromiumUnavailableReason: null,
+    realChromium: idleReal,
     persistent: false, profileId: null, url: null, service: null, error: null, automationReady: false,
     interactive: false, navigating: false,
   };
@@ -31,6 +36,20 @@ export function runBrowserRegressionChecks() {
   assert.equal(defaultBrowserEngine(enginesWith), 'scrapling');
   assert.equal(defaultBrowserEngine([{ id: 'webkit', label: 'WebKit' }]), 'webkit');
   assert.equal(defaultBrowserEngine([]), 'unavailable');
+  // Installed real Chrome advertises first and therefore becomes the default.
+  assert.equal(defaultBrowserEngine([
+    { id: 'chromium', label: 'Chrome (full browser)' },
+    ...enginesWith,
+  ]), 'chromium');
+  // Real-browser card lines stay honest for every lifecycle phase.
+  assert.equal(realChromiumStatusLine(idleReal), 'Chrome 151.0.7922.34 downloads on first use (about 190 MB).');
+  assert.equal(realChromiumStatusLine({ ...idleReal, installed: true }), 'Chrome is installed and ready to open.');
+  assert.equal(realChromiumStatusLine({ ...idleReal, phase: 'downloading', progressPercent: 37 }), 'Downloading Chrome 151.0.7922.34… 37%');
+  assert.equal(realChromiumStatusLine({ ...idleReal, phase: 'running', pid: 4242, cdpReady: true }), 'Chrome is running (pid 4242) · assistant link ready');
+  assert.equal(realChromiumStatusLine({ ...idleReal, phase: 'running', pid: null, cdpReady: false }), 'Chrome is running');
+  assert.equal(realChromiumStatusLine({ ...idleReal, phase: 'exited' }), 'Chrome was closed. Open it again any time — your sign-ins are kept.');
+  assert.equal(realChromiumStatusLine({ ...idleReal, phase: 'error', error: 'The Chrome download could not be completed. Check your connection and try again.' }), 'The Chrome download could not be completed. Check your connection and try again.');
+  assert.equal(realChromiumStatusLine({ ...idleReal, phase: 'error' }), 'Chrome could not be prepared.');
   assert.equal(browserActionFailure({ ...status, availableEngines: enginesWith, engine: 'scrapling', phase: 'open', interactive: false, navigating: true }), null);
   assert.equal(browserActionFailure({ ...status, engine: 'scrapling', phase: 'error', error: 'The page could not be fetched by the Scrapling engine.' }), 'The page could not be fetched by the Scrapling engine.');
   assert.equal(browserActionFailure(status), null);
@@ -56,7 +75,14 @@ export function runBrowserRegressionChecks() {
   const websiteActions = browserView.slice(browserView.indexOf('export function BrowserConnections('), browserView.indexOf('export function BrowserView('));
   const engineStates = browserView.slice(browserView.indexOf('export function BrowserView('));
   assert.match(engineStates, /defaultBrowserEngine\(engines\)/);
-  assert.match(engineStates, /aria-checked=\{engineChoice === 'scrapling'\}/);
+  assert.match(engineStates, /aria-checked=\{engineChoice === engine\.id\}/);
+  // The real-browser card is honest: install/run status line, drive toggle
+  // default-off wording, and the founder's sign-in note.
+  assert.match(engineStates, /realChromiumStatusLine\(real\)/);
+  assert.match(engineStates, /Sign in to your accounts here; the assistant can drive this browser when you ask\./);
+  assert.match(engineStates, /Assistant may drive the browser/);
+  assert.match(engineStates, /Off by default\. When on, the assistant can control this Chrome while it is open\./);
+  assert.match(engineStates, /checked=\{assistantDrive\}/);
   assert.match(engineStates, /Fetching the page through the Scrapling engine…/);
   assert.match(engineStates, /Read-only snapshots: pages are fetched by Scrapling's engine and shown without live scripts\. Typing and signing in inside this window are not supported yet\./);
   assert.match(engineStates, /browser\.status\.navigating && open/);

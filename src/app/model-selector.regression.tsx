@@ -15,7 +15,7 @@ export function runModelSelectorRegressionChecks(): string[] {
   Object.defineProperty(nativeStore, 'bridge', { value: { native: true } });
   const base: AppSnapshot = {
     ...store.getSnapshot(),
-    settings: { schemaVersion: 1, onboardingComplete: true, onboardingStep: 2, displayName: '', ambientMotion: false,
+    settings: { schemaVersion: 1, onboardingComplete: true, onboardingStep: 2, displayName: '', ambientMotion: false, assistantBrowserDrive: false,
       provider: { label: 'Fixture', baseUrl: 'http://localhost:9999/v1', model: 'claude-opus-5', hasKey: true, verified: true, lastCheckedAt: null } },
     models: ['astra', 'claude-opus-5', 'claude-opus-4-5-20251101'], modelsStatus: 'ready',
   };

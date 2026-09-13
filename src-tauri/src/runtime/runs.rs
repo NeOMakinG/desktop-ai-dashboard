@@ -589,21 +589,27 @@ async fn dispatch_tool(
         crate::connectors::composio::RUNTIME_LIST_TOOL
             | crate::connectors::composio::RUNTIME_CONNECT_TOOL
     );
+    // The browser-session tool is likewise grant-free: it returns only a
+    // host-gated availability status plus a loopback CDP endpoint, and the
+    // hand-off itself is separately gated on the user's default-off
+    // "assistant may drive the browser" preference. No account data flows.
+    let browser_tool = tool.tool_name == crate::browser::RUNTIME_BROWSER_SESSION_TOOL;
+    let grant_free = composio_tool || browser_tool;
     if tool.run_id != request.progress.request_id
         || tool.workspace_id != request.input.workspace_id
         || tool.device_id != caps.device_id
-        || (!composio_tool && !request.input.grant_refs.contains(&tool.grant_ref))
+        || (!grant_free && !request.input.grant_refs.contains(&tool.grant_ref))
     {
         return Err(transport::protocol());
     }
     let operation = match tool.tool_name.as_str() {
         "forma_gmail_list_metadata" => Some(ReadOperation::GmailListMetadata),
         "forma_calendar_list_events" => Some(ReadOperation::CalendarListEvents),
-        _ if composio_tool => None,
+        _ if grant_free => None,
         _ => return Err(transport::protocol()),
     };
     validation::id(&tool.id)?;
-    if !composio_tool {
+    if !grant_free {
         validation::id(&tool.connection_id)?;
     }
     let path = format!("/v1/runs/{}", request.progress.request_id);
@@ -636,6 +642,7 @@ async fn dispatch_tool(
     }
     let mut delivery_context: Option<RuntimeReadContext> = None;
     let result: AppResult<Value> = match operation {
+        None if browser_tool => crate::browser::runtime_browser_session(app),
         None => {
             // Native Composio work is bounded by the claim window (F2): an
             // overrun reports an honest unavailable outcome instead of
