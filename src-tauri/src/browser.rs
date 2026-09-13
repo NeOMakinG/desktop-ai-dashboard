@@ -8,6 +8,7 @@
 //! * "scrapling" — read-only snapshot engine behind the egress relay.
 //! * "webkit" — the isolated WebKit window on macOS 14+.
 
+mod cdp;
 mod chromium;
 pub(crate) mod engine;
 #[cfg(target_os = "macos")]
@@ -103,8 +104,9 @@ fn browser_engines_with(
     let _ = app_data;
     let mut engines: Vec<AvailableEngine> = Vec::new();
     let chromium_supported = chromium::supported();
-    let chromium_installed =
-        chromium_supported && app_data.map(chromium::installed).unwrap_or(false);
+    // "Installed" now means openable without a download: the user's own
+    // system Chrome (preferred, stealth addendum) or the bundled CFT.
+    let chromium_installed = chromium_supported && chromium::openable(app_data);
     let chromium_engine = AvailableEngine {
         id: chromium::ENGINE_ID,
         label: chromium::ENGINE_LABEL,
@@ -195,6 +197,9 @@ pub struct BrowserState {
     engine: Arc<Mutex<Option<engine::EngineRuntime>>>,
     pub(crate) snapshots: engine::SharedSnapshots,
     pub(crate) real: Arc<chromium::RealChromium>,
+    /// Live embedded-Chrome surface (CDP client + tab state), present only
+    /// while the real browser runs and its control socket is connected.
+    embedded: Arc<Mutex<Option<Arc<cdp::Embedded>>>>,
 }
 
 impl BrowserState {
@@ -238,6 +243,7 @@ impl BrowserState {
             engine: Arc::new(Mutex::new(None)),
             snapshots: Arc::new(Mutex::new(engine::SnapshotStore::default())),
             real,
+            embedded: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -820,20 +826,35 @@ async fn open_real_chromium(
             (url.as_str() != "about:blank").then(|| url.to_string())
         }
     };
-    // Focus path: a live Chrome owns the profile lock; spawning the binary
-    // again forwards to that instance (focus / new tab) and exits itself.
+    // Live path: the embedded surface owns the running browser — open the
+    // requested destination as a new CDP tab (it appears in Forma's own tab
+    // strip), or just report status when no destination was given.
     if state.real.live().is_some() {
-        let mut command =
-            tokio::process::Command::new(chromium::executable_path(&app_data));
-        command
-            .args(chromium::build_argv(
-                &chromium::profile_dir(&app_data),
-                target.as_deref(),
-            ))
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        let _ = command.spawn();
+        if let Some(url) = target.as_deref() {
+            if let Ok(embedded) = embedded_handle(&state) {
+                let _ = embedded
+                    .client
+                    .call(None, "Target.createTarget", serde_json::json!({ "url": url }))
+                    .await;
+            } else {
+                // No control channel (edge: popped-out relaunch race) —
+                // forward to the live instance via a second spawn, which
+                // opens the URL there and exits itself.
+                if let Some(binary) = chromium::resolve_binary(&app_data) {
+                    let mut command = tokio::process::Command::new(binary);
+                    command
+                        .args(chromium::build_argv(
+                            &chromium::profile_dir(&app_data),
+                            Some(url),
+                            true,
+                        ))
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null());
+                    let _ = command.spawn();
+                }
+            }
+        }
         state.emit();
         return state.status();
     }
@@ -863,28 +884,35 @@ async fn real_install_and_launch(
     target: Option<&str>,
 ) -> AppResult<()> {
     use chromium::RealPhase;
-    if !chromium::installed(app_data) {
-        state
-            .real
-            .progress(generation, RealPhase::Downloading, Some(0));
-        state.emit();
-        let progress = state.clone();
-        let zip = chromium::download_zip(app_data, move |percent| {
-            progress
+    // Stealth addendum: prefer the user's own installed Google Chrome (real
+    // userAgentData brands, no download). Chrome for Testing is only the
+    // fallback, downloaded and hash-verified on first use.
+    let binary = if chromium::binary_kind(Some(app_data)) == Some(chromium::BINARY_SYSTEM) {
+        std::path::PathBuf::from(chromium::SYSTEM_CHROME_BINARY)
+    } else {
+        if !chromium::installed(app_data) {
+            state
                 .real
-                .progress(generation, RealPhase::Downloading, Some(percent));
-            progress.emit();
-        })
-        .await?;
-        state.real.progress(generation, RealPhase::Extracting, None);
+                .progress(generation, RealPhase::Downloading, Some(0));
+            state.emit();
+            let progress = state.clone();
+            let zip = chromium::download_zip(app_data, move |percent| {
+                progress
+                    .real
+                    .progress(generation, RealPhase::Downloading, Some(percent));
+                progress.emit();
+            })
+            .await?;
+            state.real.progress(generation, RealPhase::Extracting, None);
+            state.emit();
+            chromium::extract_zip(app_data, &zip).await?;
+            // The verified install is cached forever; the archive is not.
+            let _ = std::fs::remove_file(&zip);
+        }
+        state.real.progress(generation, RealPhase::Verifying, None);
         state.emit();
-        chromium::extract_zip(app_data, &zip).await?;
-        // The verified install is cached forever; the archive is not.
-        let _ = std::fs::remove_file(&zip);
-    }
-    state.real.progress(generation, RealPhase::Verifying, None);
-    state.emit();
-    let binary = chromium::verify_binary(app_data).await?;
+        chromium::verify_binary(app_data).await?
+    };
     state.real.progress(generation, RealPhase::Launching, None);
     state.emit();
     let profile = chromium::profile_dir(app_data);
@@ -898,7 +926,9 @@ async fn real_install_and_launch(
     let _ = std::fs::remove_file(profile.join("DevToolsActivePort"));
     let mut command = tokio::process::Command::new(&binary);
     command
-        .args(chromium::build_argv(&profile, target))
+        // Embedded launch (default experience): same headful Chrome, window
+        // parked offscreen; Forma renders it in-app via the CDP screencast.
+        .args(chromium::build_argv(&profile, target, true))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -919,6 +949,14 @@ async fn real_install_and_launch(
         }
     };
     state.real.running(generation, pid, port);
+    // Embedded surface: connect the native CDP client and start the
+    // screencast/tab pump. The Chrome window itself stays offscreen.
+    if let Some(app) = state.app.clone() {
+        let surface = state.clone();
+        tauri::async_runtime::spawn(async move {
+            establish_embedded(app, surface, generation, port).await;
+        });
+    }
     // Exit monitor (generation-fenced): the user quitting Chrome themselves
     // is an honest "exited" state, never a pretend-running card.
     let monitor = state.clone();
@@ -928,6 +966,533 @@ async fn real_install_and_launch(
         monitor.emit();
     });
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Embedded Chrome surface: the real browser rendered ENTIRELY inside the
+// Forma window via CDP screencast (founder directive 2026-09-13). Human input
+// is forwarded through Input.dispatch* — these traverse Chrome's real input
+// pipeline, so pages see trusted (`isTrusted`) events; combined with the
+// headful window and the user's own IP this preserves the anti-ban posture.
+// No script is ever injected into pages for this path (zero JS fingerprint).
+// ---------------------------------------------------------------------------
+
+const EMBEDDED_STATE_EVENT: &str = "embedded-browser:state";
+const EMBEDDED_FRAME_EVENT: &str = "embedded-browser:frame";
+
+fn embedded_handle(state: &BrowserState) -> AppResult<Arc<cdp::Embedded>> {
+    state
+        .embedded
+        .lock()
+        .ok()
+        .and_then(|slot| slot.clone())
+        .ok_or_else(|| AppError::new("browser_closed", cdp::NOT_EMBEDDED))
+}
+
+fn emit_embedded_state(app: &AppHandle, payload: serde_json::Value) {
+    // First-party main window only — never broadcast tab URLs to remote content.
+    let _ = app.emit_to(
+        tauri::EventTarget::webview_window("main"),
+        EMBEDDED_STATE_EVENT,
+        payload,
+    );
+}
+
+/// Target.activateTarget raises the Chrome window AND activates the app on
+/// macOS. While embedded (not popped out) that would surface the hidden
+/// window, so every activation is followed by an immediate re-hide and a
+/// focus hand-back to Forma. Popped out, raising the window is the point.
+fn embedded_rehide(app: &AppHandle, state: &BrowserState, embedded: &cdp::Embedded) {
+    let popped = embedded.popped_out.lock().map(|p| *p).unwrap_or(false);
+    if popped {
+        return;
+    }
+    #[cfg(target_os = "macos")]
+    if let Some((pid, _)) = state.real.live() {
+        let _ = chromium::set_app_hidden(pid, true);
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = state;
+    if let Some(main) = app.get_webview_window("main") {
+        let _ = main.set_focus();
+    }
+}
+
+/// Supervise the CDP control channel for one browser generation: connect,
+/// pump events until the socket drops, and reconnect while Chrome is still
+/// live (the DevTools websocket can drop without the browser exiting — e.g.
+/// after the app is hidden). Only a real browser exit, or a newer generation,
+/// ends the loop. Teardown is generation-fenced so a stale supervisor never
+/// clears a newer surface.
+async fn establish_embedded(app: AppHandle, state: BrowserState, generation: u64, port: u16) {
+    let mut popped_out = false;
+    loop {
+        // Stop if this generation is no longer the live browser.
+        if state.real.generation() != generation || state.real.live().is_none() {
+            break;
+        }
+        // The port can change across a relaunch; re-read the live one.
+        let live_port = state.real.live().map(|(_, p)| p).unwrap_or(port);
+        let Ok((client, events)) = cdp::connect(live_port).await else {
+            // Chrome may still be starting its debugger back up; retry briefly.
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            if state.real.generation() != generation || state.real.live().is_none() {
+                break;
+            }
+            continue;
+        };
+        let embedded = Arc::new(cdp::Embedded::new(client, generation));
+        // Preserve pop-out state across a reconnect so a dropped socket does
+        // not silently re-hide a window the user chose to pop out.
+        if let Ok(mut slot) = embedded.popped_out.lock() {
+            *slot = popped_out;
+        }
+        if embedded
+            .client
+            .call(
+                None,
+                "Target.setDiscoverTargets",
+                serde_json::json!({ "discover": true }),
+            )
+            .await
+            .is_err()
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            continue;
+        }
+        if let Ok(mut slot) = state.embedded.lock() {
+            *slot = Some(embedded.clone());
+        }
+        // Embedded default: hide the Chrome app (macOS clamps fully-offscreen
+        // windows, so Cmd+H semantics is the honest "entirely inside Forma"
+        // mechanism; the occlusion launch flag keeps the screencast streaming).
+        // A reconnect while popped out must NOT re-hide.
+        #[cfg(target_os = "macos")]
+        if !popped_out {
+            if let Some((pid, _)) = state.real.live() {
+                let _ = chromium::set_app_hidden(pid, true);
+            }
+        }
+        emit_embedded_state(&app, embedded.state_payload());
+        embedded_pump(&app, &state, &embedded, events).await;
+        // Remember the pop-out state for the next connection attempt.
+        popped_out = embedded.popped_out.lock().map(|p| *p).unwrap_or(popped_out);
+        // Pump returned: the socket dropped. Clear the slot only if it is
+        // still ours, then decide whether to reconnect.
+        if let Ok(mut slot) = state.embedded.lock() {
+            if slot.as_ref().map(|live| live.generation) == Some(generation) {
+                *slot = None;
+            }
+        }
+        if state.real.generation() != generation || state.real.live().is_none() {
+            break;
+        }
+        // Chrome is still alive: this was a transient socket drop. Tell the
+        // renderer we are reconnecting (it keeps the last frame) rather than
+        // letting a command surface a hard error.
+        emit_embedded_state(&app, embedded.reconnecting_payload());
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    }
+    // The browser really exited (or was superseded): announce a closed surface.
+    if state
+        .embedded
+        .lock()
+        .map(|slot| slot.as_ref().map(|e| e.generation) != Some(generation))
+        .unwrap_or(true)
+    {
+        // slot already belongs to a newer generation — leave it.
+    }
+    emit_embedded_state(
+        &app,
+        serde_json::json!({ "running": false, "poppedOut": false, "tabs": [], "activeId": null }),
+    );
+}
+
+async fn embedded_pump(
+    app: &AppHandle,
+    state: &BrowserState,
+    embedded: &Arc<cdp::Embedded>,
+    mut events: tokio::sync::mpsc::UnboundedReceiver<cdp::CdpEvent>,
+) {
+    while let Some(event) = events.recv().await {
+        match event.method.as_str() {
+            "Target.targetCreated" | "Target.targetInfoChanged" => {
+                let info = event.params["targetInfo"].clone();
+                let is_new = embedded
+                    .tabs
+                    .lock()
+                    .map(|mut tabs| tabs.upsert(&info))
+                    .unwrap_or(false);
+                if is_new {
+                    if let Some(target_id) = info["targetId"].as_str() {
+                        attach_tab(app, state, embedded, target_id).await;
+                    }
+                }
+                emit_embedded_state(app, embedded.state_payload());
+            }
+            "Target.targetDestroyed" => {
+                let id = event.params["targetId"].as_str().unwrap_or_default().to_string();
+                let was_active = embedded
+                    .tabs
+                    .lock()
+                    .map(|mut tabs| tabs.remove(&id))
+                    .unwrap_or(false);
+                if was_active {
+                    let next = embedded.tabs.lock().ok().and_then(|tabs| tabs.first_id());
+                    if let Some(next) = next {
+                        let _ = embedded.activate(&next).await;
+                        embedded_rehide(app, state, embedded);
+                    }
+                }
+                emit_embedded_state(app, embedded.state_payload());
+            }
+            "Page.screencastFrame" => {
+                let Some(session) = event.session.as_deref() else { continue };
+                // Ack every frame — even from a tab that just went inactive —
+                // otherwise Chrome stops the stream.
+                if let Some(ack) = event.params.get("sessionId") {
+                    embedded.client.fire(
+                        Some(session),
+                        "Page.screencastFrameAck",
+                        serde_json::json!({ "sessionId": ack }),
+                    );
+                }
+                let (active, tab) = embedded
+                    .tabs
+                    .lock()
+                    .map(|tabs| (tabs.active_session(), tabs.tab_id_by_session(session)))
+                    .unwrap_or((None, None));
+                if active.as_deref() == Some(session) {
+                    if let Some(tab) = tab {
+                        let _ = app.emit_to(
+                            tauri::EventTarget::webview_window("main"),
+                            EMBEDDED_FRAME_EVENT,
+                            serde_json::json!({
+                                "tab": tab,
+                                "data": event.params["data"],
+                                "metadata": event.params["metadata"],
+                            }),
+                        );
+                    }
+                }
+            }
+            "Page.frameNavigated" => {
+                // Top frame only: subframe navigations are not tab URL changes.
+                if event.params["frame"]["parentId"].is_null() {
+                    if let (Some(session), Some(url)) = (
+                        event.session.as_deref(),
+                        event.params["frame"]["url"].as_str(),
+                    ) {
+                        let changed = embedded
+                            .tabs
+                            .lock()
+                            .map(|mut tabs| tabs.navigated(session, url))
+                            .unwrap_or(false);
+                        if changed {
+                            emit_embedded_state(app, embedded.state_payload());
+                        }
+                    }
+                }
+            }
+            "Page.frameStartedLoading" | "Page.frameStoppedLoading" => {
+                if let Some(session) = event.session.as_deref() {
+                    let loading = event.method == "Page.frameStartedLoading";
+                    let changed = embedded
+                        .tabs
+                        .lock()
+                        .map(|mut tabs| tabs.set_loading(session, loading))
+                        .unwrap_or(false);
+                    if changed {
+                        emit_embedded_state(app, embedded.state_payload());
+                    }
+                    // When the active tab finishes loading, force a fresh
+                    // screencast frame. While the Chrome window is hidden the
+                    // compositor coalesces frames, so a completed navigation
+                    // would otherwise leave a stale (or blank) canvas until the
+                    // user interacts. Restarting the stream pushes one now.
+                    if !loading
+                        && embedded
+                            .tabs
+                            .lock()
+                            .map(|tabs| tabs.active_session().as_deref() == Some(session))
+                            .unwrap_or(false)
+                    {
+                        embedded.restart_screencast(session).await;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Attach a per-tab session and enable Page events. The first attached tab
+/// (or one the user just created) becomes active and starts its screencast.
+async fn attach_tab(app: &AppHandle, state: &BrowserState, embedded: &Arc<cdp::Embedded>, target_id: &str) {
+    let Ok(reply) = embedded
+        .client
+        .call(
+            None,
+            "Target.attachToTarget",
+            serde_json::json!({ "targetId": target_id, "flatten": true }),
+        )
+        .await
+    else {
+        return;
+    };
+    let Some(session) = reply["sessionId"].as_str() else { return };
+    if let Ok(mut tabs) = embedded.tabs.lock() {
+        tabs.attach(target_id, session);
+    }
+    let _ = embedded
+        .client
+        .call(Some(session), "Page.enable", serde_json::json!({}))
+        .await;
+    let should_activate = embedded
+        .tabs
+        .lock()
+        .map(|tabs| {
+            let active = tabs.active_id();
+            active.is_none() || active.as_deref() == Some(target_id)
+        })
+        .unwrap_or(false);
+    if should_activate {
+        let _ = embedded.activate(target_id).await;
+        embedded_rehide(app, state, embedded);
+    }
+}
+
+#[tauri::command]
+pub async fn browser_embedded_state(
+    window: WebviewWindow,
+    state: State<'_, BrowserState>,
+) -> AppResult<serde_json::Value> {
+    crate::first_party(&window)?;
+    Ok(match embedded_handle(state.inner()) {
+        Ok(embedded) => embedded.state_payload(),
+        Err(_) => {
+            serde_json::json!({ "running": false, "poppedOut": false, "tabs": [], "activeId": null })
+        }
+    })
+}
+
+#[tauri::command]
+pub async fn browser_embedded_new_tab(
+    window: WebviewWindow,
+    state: State<'_, BrowserState>,
+    url: Option<String>,
+) -> AppResult<serde_json::Value> {
+    crate::first_party(&window)?;
+    let embedded = embedded_handle(state.inner())?;
+    let target = match url.as_deref() {
+        Some(raw) => state.validate_url(raw)?.to_string(),
+        None => "about:blank".to_string(),
+    };
+    let reply = embedded
+        .client
+        .call(None, "Target.createTarget", serde_json::json!({ "url": target }))
+        .await?;
+    // The created target is announced asynchronously; retry activation until
+    // the reducer has it (bounded), so the new tab is what the user sees.
+    if let Some(target_id) = reply["targetId"].as_str() {
+        for _ in 0..20 {
+            if embedded.activate(target_id).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+    if let Some(app) = state.app.as_ref() {
+        embedded_rehide(app, state.inner(), &embedded);
+    }
+    Ok(embedded.state_payload())
+}
+
+#[tauri::command]
+pub async fn browser_embedded_activate_tab(
+    window: WebviewWindow,
+    state: State<'_, BrowserState>,
+    target: String,
+) -> AppResult<serde_json::Value> {
+    crate::first_party(&window)?;
+    let embedded = embedded_handle(state.inner())?;
+    embedded.activate(&target).await?;
+    if let Some(app) = state.app.as_ref() {
+        embedded_rehide(app, state.inner(), &embedded);
+    }
+    Ok(embedded.state_payload())
+}
+
+#[tauri::command]
+pub async fn browser_embedded_close_tab(
+    window: WebviewWindow,
+    state: State<'_, BrowserState>,
+    target: String,
+) -> AppResult<serde_json::Value> {
+    crate::first_party(&window)?;
+    let embedded = embedded_handle(state.inner())?;
+    embedded
+        .client
+        .call(None, "Target.closeTarget", serde_json::json!({ "targetId": target }))
+        .await?;
+    Ok(embedded.state_payload())
+}
+
+#[tauri::command]
+pub async fn browser_embedded_navigate(
+    window: WebviewWindow,
+    state: State<'_, BrowserState>,
+    url: String,
+) -> AppResult<serde_json::Value> {
+    crate::first_party(&window)?;
+    let embedded = embedded_handle(state.inner())?;
+    // Forma's own address bar keeps the app-side URL gate (https-only,
+    // credential and restricted-destination checks) — link clicks inside the
+    // page remain the user's own browsing, exactly like Safari.
+    let url = state.validate_url(&url)?;
+    let session = embedded.active_session()?;
+    embedded
+        .client
+        .call(
+            Some(&session),
+            "Page.navigate",
+            serde_json::json!({ "url": url.as_str() }),
+        )
+        .await?;
+    Ok(embedded.state_payload())
+}
+
+#[tauri::command]
+pub async fn browser_embedded_history(
+    window: WebviewWindow,
+    state: State<'_, BrowserState>,
+    action: String,
+) -> AppResult<serde_json::Value> {
+    crate::first_party(&window)?;
+    let embedded = embedded_handle(state.inner())?;
+    let session = embedded.active_session()?;
+    match action.as_str() {
+        "reload" => {
+            embedded
+                .client
+                .call(Some(&session), "Page.reload", serde_json::json!({}))
+                .await?;
+        }
+        "back" | "forward" => {
+            let history = embedded
+                .client
+                .call(Some(&session), "Page.getNavigationHistory", serde_json::json!({}))
+                .await?;
+            let index = history["currentIndex"].as_i64().unwrap_or(0);
+            let target = if action == "back" { index - 1 } else { index + 1 };
+            let entry = usize::try_from(target)
+                .ok()
+                .and_then(|i| history["entries"].as_array()?.get(i)?.get("id")?.as_i64());
+            if let Some(entry) = entry {
+                embedded
+                    .client
+                    .call(
+                        Some(&session),
+                        "Page.navigateToHistoryEntry",
+                        serde_json::json!({ "entryId": entry }),
+                    )
+                    .await?;
+            }
+        }
+        _ => {
+            return Err(AppError::new(
+                "browser_navigation_failed",
+                "Unknown history action.",
+            ))
+        }
+    }
+    Ok(embedded.state_payload())
+}
+
+/// Forward one human input event to the active tab. Fire-and-forget: a
+/// 15–25fps interaction stream never queues behind response round-trips.
+/// See module comment — dispatched events are trusted, real-pipeline input.
+#[tauri::command]
+pub async fn browser_embedded_input(
+    window: WebviewWindow,
+    state: State<'_, BrowserState>,
+    event: cdp::EmbeddedInput,
+) -> AppResult<()> {
+    crate::first_party(&window)?;
+    let embedded = embedded_handle(state.inner())?;
+    let session = embedded.active_session()?;
+    if let Some((method, params)) = cdp::input_command(&event) {
+        embedded.client.fire(Some(&session), method, params);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn browser_embedded_viewport(
+    window: WebviewWindow,
+    state: State<'_, BrowserState>,
+    width: u32,
+    height: u32,
+    scale: f64,
+) -> AppResult<()> {
+    crate::first_party(&window)?;
+    let embedded = embedded_handle(state.inner())?;
+    let viewport = cdp::viewport_for(width, height, scale);
+    let unchanged = embedded
+        .viewport
+        .lock()
+        .map(|current| *current == viewport)
+        .unwrap_or(false);
+    if unchanged {
+        return Ok(());
+    }
+    if let Ok(mut slot) = embedded.viewport.lock() {
+        *slot = viewport;
+    }
+    // Restart the stream so frames adopt the new bounds.
+    if let Ok(session) = embedded.active_session() {
+        embedded
+            .client
+            .fire(Some(&session), "Page.stopScreencast", serde_json::json!({}));
+        embedded.start_screencast(&session).await;
+    }
+    Ok(())
+}
+
+/// Pop the real Chrome window out onto the screen (external mode) or back
+/// into the hidden embedded state. Same window, same session, both ways —
+/// pop out unhides + activates the Chrome app; pop in re-hides it and
+/// returns focus to Forma.
+#[tauri::command]
+pub async fn browser_embedded_pop(
+    window: WebviewWindow,
+    app: AppHandle,
+    state: State<'_, BrowserState>,
+    out: bool,
+) -> AppResult<serde_json::Value> {
+    crate::first_party(&window)?;
+    let embedded = embedded_handle(state.inner())?;
+    let pid = state
+        .real
+        .live()
+        .map(|(pid, _)| pid)
+        .ok_or_else(|| AppError::new("browser_closed", cdp::NOT_EMBEDDED))?;
+    #[cfg(target_os = "macos")]
+    if !chromium::set_app_hidden(pid, !out) {
+        return Err(AppError::new("browser_pop_failed", cdp::CDP_FAILED));
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = pid;
+    if !out {
+        if let Some(main) = app.get_webview_window("main") {
+            let _ = main.set_focus();
+        }
+    }
+    if let Ok(mut popped) = embedded.popped_out.lock() {
+        *popped = out;
+    }
+    emit_embedded_state(&app, embedded.state_payload());
+    Ok(embedded.state_payload())
 }
 
 /// The `forma_browser_session` runtime tool name (wired in runtime/runs.rs).
@@ -1643,12 +2208,17 @@ mod tests {
                 other => panic!("unexpected engine id: {other}"),
             }
         }
-        // Without an installed binary the real browser never claims default.
+        // Without any openable binary the real browser never claims default;
+        // with a system Chrome present (stealth-preferred) it IS the default.
         if chromium::supported() {
             let uninstalled =
                 browser_engines_with(None, Some(std::path::Path::new("/nonexistent")));
-            assert_eq!(uninstalled.last().map(|e| e.id), Some("chromium"));
-            assert_ne!(uninstalled.first().map(|e| e.id), Some("chromium"));
+            if chromium::openable(Some(std::path::Path::new("/nonexistent"))) {
+                assert_eq!(uninstalled.first().map(|e| e.id), Some("chromium"));
+            } else {
+                assert_eq!(uninstalled.last().map(|e| e.id), Some("chromium"));
+                assert_ne!(uninstalled.first().map(|e| e.id), Some("chromium"));
+            }
         }
     }
 

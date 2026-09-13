@@ -49,6 +49,36 @@
 .browser-details p { color:var(--secondary); line-height:1.7; max-width:720px; }
 .browser-page > .inline-error { max-width:1000px; margin:0 auto 16px; }
 .browser-connections .button:disabled { cursor:not-allowed; opacity:.45; }
+/* Full-panel embedded browser: edge-to-edge, no hero, no card (founder). */
+.browser-page.embedded-full { padding:0; overflow:hidden; display:flex; flex-direction:column; }
+.browser-page.embedded-full > .inline-error { margin:8px; }
+.embedded-full .embedded-chrome { flex:1; min-height:0; margin:0; max-width:none; border:0; border-radius:0; padding:0; gap:0; background:var(--canvas); }
+.embedded-full .embedded-tabstrip { padding:8px 12px 0; }
+.embedded-full .embedded-toolbar { padding:8px 12px; border-bottom:1px solid var(--border); }
+.embedded-full .embedded-frame { flex:1; min-height:0; height:auto; border:0; border-radius:0; }
+.embedded-chrome { display:flex; flex-direction:column; gap:8px; max-width:1000px; margin:0 auto 32px; padding:12px; border:1px solid var(--border); border-radius:20px; background:var(--panel); }
+.embedded-tabstrip { display:flex; align-items:center; gap:4px; min-height:36px; overflow-x:auto; }
+.embedded-tab { display:flex; align-items:center; gap:2px; max-width:220px; min-width:0; padding:2px 4px; border:1px solid transparent; border-radius:8px; background:transparent; color:var(--secondary); }
+.embedded-tab.active { background:var(--canvas); border-color:var(--border); color:var(--ink); }
+.embedded-tab-label { display:flex; align-items:center; gap:8px; min-width:0; padding:4px 8px; border:0; background:transparent; color:inherit; font:inherit; font-size:12px; cursor:pointer; }
+.embedded-tab-label span:last-child { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:160px; }
+.embedded-tab-spinner { width:8px; height:8px; flex:0 0 auto; border-radius:50%; background:var(--focus-border); animation:embedded-pulse 1s ease-in-out infinite; }
+@keyframes embedded-pulse { 0%,100% { opacity:.3; } 50% { opacity:1; } }
+.embedded-tab-close { width:20px; height:20px; min-width:20px; }
+.embedded-newtab { flex:0 0 auto; }
+.embedded-toolbar { display:flex; align-items:center; gap:8px; }
+.embedded-toolbar .text-button { padding:8px; flex:0 0 auto; }
+.embedded-address { flex:1; }
+.embedded-pop { display:flex; align-items:center; gap:4px; white-space:nowrap; }
+.embedded-drive { display:flex; align-items:center; gap:8px; flex:0 0 auto; white-space:nowrap; font-size:12px; color:var(--secondary); }
+.embedded-reconnect { display:flex; align-items:center; gap:8px; padding:8px 12px; font-size:12px; color:var(--secondary); background:var(--field); border-bottom:1px solid var(--border); }
+.embedded-reconnect .text-button { margin-left:auto; }
+.embedded-frame { position:relative; min-height:420px; height:min(62vh,720px); border:1px solid var(--composer-border); border-radius:12px; background:var(--canvas); overflow:hidden; }
+.embedded-canvas { position:absolute; inset:0; width:100%; height:100%; display:block; outline:0; cursor:default; }
+.embedded-frame:focus-within { border-color:var(--focus-border); }
+.embedded-focus-hint { position:absolute; left:50%; bottom:16px; transform:translateX(-50%); padding:8px 16px; border:1px solid var(--border); border-radius:8px; background:var(--panel); color:var(--secondary); font:inherit; font-size:12px; cursor:pointer; box-shadow:0 4px 16px var(--composer-shadow); }
+.embedded-placeholder { position:absolute; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:16px; color:var(--secondary); font-size:13px; }
+.embedded-placeholder p { margin:0; }
 @media(max-width:1100px) { .browser-page { padding:24px 24px 48px; } .browser-home-card { gap:24px; padding:24px; } .browser-home-copy h2 { font-size:21px; } }
 @media(max-width:780px) { .browser-home-card { grid-template-columns:1fr; } .browser-window-preview { min-height:160px; } .browser-preview-content { min-height:128px; } .browser-history-controls { display:none; } .browser-page { padding:24px 24px 32px; } .browser-heading h1 { font-size:26px; } .browser-add-service { align-items:stretch; flex-direction:column; } }
 @media(prefers-reduced-motion:reduce) { .browser-page * { scroll-behavior:auto; } }

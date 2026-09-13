@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { ArrowLeft, ArrowRight, ArrowSquareOut, Browser, CalendarBlank, EnvelopeSimple, Globe, LockSimple, X } from '@phosphor-icons/react';
 import { IconButton, InlineError } from './components';
-import { defaultBrowserEngine, realChromiumStatusLine, type BrowserEngine, type BrowserService } from './browser-contracts';
+import { defaultBrowserEngine, realChromiumBinaryLabel, realChromiumStatusLine, type BrowserEngine, type BrowserService } from './browser-contracts';
+import { EmbeddedChrome } from './EmbeddedChrome';
 import type { OwnedBrowser } from './owned-browser';
 import './browser.css';
 
@@ -56,6 +57,7 @@ export function BrowserView({ browser, assistantDrive, onAssistantDrive }: {
   onAssistantDrive: (enabled: boolean) => void;
 }) {
   const [address, setAddress] = useState('');
+  const [embeddedError, setEmbeddedError] = useState<string | null>(null);
   const editing = useRef(false);
   const open = browser.status.phase === 'open';
   const enabled = browser.native && browser.status.available && !browser.busy;
@@ -92,6 +94,20 @@ export function BrowserView({ browser, assistantDrive, onAssistantDrive }: {
   const realSelected = chromiumAdvertised && engineChoice === 'chromium';
   const realRunning = real.phase === 'running';
   const realBusy = real.phase === 'downloading' || real.phase === 'extracting' || real.phase === 'verifying' || real.phase === 'launching';
+  // The embedded in-app surface replaces the generic toolbar/home card while
+  // the real Chrome is running: its own tab strip, address bar, and canvas.
+  const embeddedActive = realSelected && realRunning;
+
+  // Founder directive: while the real Chrome runs, the embedded browser fills
+  // the ENTIRE right panel edge-to-edge like a real browser — no hero header,
+  // no card padding, tab strip at the very top, canvas takes all remaining
+  // space. Other engines keep the standard framed layout.
+  if (embeddedActive) {
+    return <section className="browser-page embedded-full" aria-label="Your browser">
+      {embeddedError && <InlineError>{embeddedError}</InlineError>}
+      <EmbeddedChrome onError={setEmbeddedError} assistantDrive={assistantDrive} onAssistantDrive={onAssistantDrive} />
+    </section>;
+  }
 
   return <section className="browser-page" aria-labelledby="browser-title">
     <header className="browser-heading">
@@ -138,6 +154,7 @@ export function BrowserView({ browser, assistantDrive, onAssistantDrive }: {
       <section className="browser-real-card" aria-labelledby="browser-real-title">
         <h2 id="browser-real-title">Chrome (full browser)</h2>
         <p className="field-note" role="status">{realChromiumStatusLine(real)}</p>
+        {realChromiumBinaryLabel(real.binary) && <p className="field-note">{realChromiumBinaryLabel(real.binary)}</p>}
         {realBusy && real.phase === 'downloading' && (
           <progress max={100} value={real.progressPercent ?? 0} aria-label="Chrome download progress" />
         )}

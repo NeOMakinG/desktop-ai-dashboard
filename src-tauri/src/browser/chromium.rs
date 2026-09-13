@@ -82,8 +82,98 @@ pub(super) fn installed(app_data: &Path) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Binary preference (stealth addendum 2026-09-13): prefer the user's OWN
+// installed Google Chrome — Chrome for Testing exposes the literal brand
+// "Chrome for Testing" in `navigator.userAgentData.brands`, a direct
+// automation tell. The real Chrome binary carries real brands. We still use
+// OUR separate `--user-data-dir` profile, never the user's default profile
+// (which since Chrome 136 also refuses remote debugging — ours does not).
+// The bundled Chrome for Testing remains the fallback when no system Chrome
+// is installed. The chosen binary is reported honestly in the status card.
+// ---------------------------------------------------------------------------
+
+pub(crate) const SYSTEM_CHROME_BINARY: &str =
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
+pub(crate) const BINARY_SYSTEM: &str = "system_chrome";
+pub(crate) const BINARY_TESTING: &str = "chrome_for_testing";
+
+pub(super) fn system_chrome_installed() -> bool {
+    supported()
+        && fs::metadata(SYSTEM_CHROME_BINARY)
+            .map(|m| m.is_file())
+            .unwrap_or(false)
+}
+
+/// Which binary would launch right now, without downloading anything.
+pub(crate) fn binary_kind(app_data: Option<&Path>) -> Option<&'static str> {
+    if system_chrome_installed() {
+        Some(BINARY_SYSTEM)
+    } else if app_data.map(installed).unwrap_or(false) {
+        Some(BINARY_TESTING)
+    } else {
+        None
+    }
+}
+
+/// True when the engine can open without a first-use download.
+pub(super) fn openable(app_data: Option<&Path>) -> bool {
+    binary_kind(app_data).is_some()
+}
+
+/// Resolve the executable to launch, preferring the system Chrome.
+pub(super) fn resolve_binary(app_data: &Path) -> Option<PathBuf> {
+    if system_chrome_installed() {
+        Some(PathBuf::from(SYSTEM_CHROME_BINARY))
+    } else if installed(app_data) {
+        Some(executable_path(app_data))
+    } else {
+        None
+    }
+}
+
+/// Hide or reveal the embedded Chrome app (Cmd+H semantics, applied to the
+/// child by pid). This is how "entirely inside Forma" works on macOS: the OS
+/// clamps fully-offscreen windows back onto the screen, but a hidden app has
+/// no visible UI at all while `EMBEDDED_OCCLUSION_FLAG` keeps the screencast
+/// streaming. Revealing (pop out) also activates the app so the real window
+/// comes to the front. Public NSRunningApplication API — no accessibility
+/// permission involved.
+#[cfg(target_os = "macos")]
+pub(super) fn set_app_hidden(pid: u32, hidden: bool) -> bool {
+    use objc2_app_kit::{NSApplicationActivationOptions, NSRunningApplication};
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    let Some(app) = NSRunningApplication::runningApplicationWithProcessIdentifier(pid) else {
+        return false;
+    };
+    if hidden {
+        app.hide()
+    } else {
+        let shown = app.unhide();
+        app.activateWithOptions(NSApplicationActivationOptions::ActivateAllWindows);
+        shown
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Launch arguments — isolated from spawning so tests inspect the command line.
 // ---------------------------------------------------------------------------
+
+/// Embedded launch (founder directive 2026-09-13): the SAME headful Chrome,
+/// but its window starts far offscreen so the user only ever sees Forma's
+/// in-app screencast surface. Deliberately NOT `--headless`: the headful
+/// fingerprint is the anti-ban design. "Pop out" later repositions this same
+/// window onscreen via Browser.setWindowBounds.
+pub(super) const EMBEDDED_POSITION_FLAG: &str = "--window-position=20000,20000";
+pub(super) const EMBEDDED_SIZE_FLAG: &str = "--window-size=1440,900";
+/// macOS clamps fully-offscreen windows back onto the screen, so the embedded
+/// window is HIDDEN (NSRunningApplication hide — Cmd+H semantics) right after
+/// the CDP surface connects. This flag keeps Chrome compositing (and thus the
+/// screencast streaming) while hidden/occluded. It is a process flag only:
+/// page JavaScript cannot observe the command line, so it adds no
+/// fingerprint surface.
+pub(super) const EMBEDDED_OCCLUSION_FLAG: &str = "--disable-backgrounding-occluded-windows";
 
 /// Build argv (arguments only, not argv[0]) for the real browser child.
 /// * `--user-data-dir` first so nothing can override the owned profile.
@@ -91,13 +181,20 @@ pub(super) fn installed(app_data: &Path) -> bool {
 ///   the chosen port to `DevToolsActivePort` inside the profile.
 /// * NO headless flag and NO `--proxy-server`: user's real window, user's
 ///   real IP (see module docs — this is the anti-ban design, on purpose).
-pub(super) fn build_argv(profile: &Path, target_url: Option<&str>) -> Vec<String> {
+/// * `embedded` adds only window placement flags (offscreen position + a
+///   sane size for the screencast), never rendering-mode flags.
+pub(super) fn build_argv(profile: &Path, target_url: Option<&str>, embedded: bool) -> Vec<String> {
     let mut argv = vec![
         format!("--user-data-dir={}", profile.display()),
         "--remote-debugging-port=0".to_string(),
         "--no-first-run".to_string(),
         "--no-default-browser-check".to_string(),
     ];
+    if embedded {
+        argv.push(EMBEDDED_POSITION_FLAG.to_string());
+        argv.push(EMBEDDED_SIZE_FLAG.to_string());
+        argv.push(EMBEDDED_OCCLUSION_FLAG.to_string());
+    }
     if let Some(url) = target_url {
         argv.push(url.to_string());
     }
@@ -132,7 +229,12 @@ pub(crate) enum RealPhase {
 #[serde(rename_all = "camelCase")]
 pub struct RealChromiumStatus {
     pub supported: bool,
+    /// True when a usable binary is present (system Chrome or the bundled
+    /// Chrome for Testing) — no first-use download needed.
     pub installed: bool,
+    /// Which binary launches: "system_chrome" (preferred, real brands) or
+    /// "chrome_for_testing" (fallback). Honest label for the status card.
+    pub binary: Option<&'static str>,
     pub phase: RealPhase,
     /// Download progress while `phase == downloading`.
     pub progress_percent: Option<u8>,
@@ -176,7 +278,8 @@ impl RealChromium {
         };
         RealChromiumStatus {
             supported: supported(),
-            installed: app_data.map(installed).unwrap_or(false),
+            installed: openable(app_data),
+            binary: binary_kind(app_data),
             phase,
             progress_percent: progress,
             pid,
@@ -510,7 +613,7 @@ mod tests {
     #[test]
     fn argv_is_headful_ephemeral_cdp_and_proxyless() {
         let profile = PathBuf::from("/data/real-browser/profiles/default");
-        let argv = build_argv(&profile, Some("https://example.com/"));
+        let argv = build_argv(&profile, Some("https://example.com/"), false);
         assert_eq!(
             argv[0],
             "--user-data-dir=/data/real-browser/profiles/default",
@@ -526,8 +629,36 @@ mod tests {
             );
         }
         assert_eq!(argv.last().unwrap(), "https://example.com/");
-        let bare = build_argv(&profile, None);
+        let bare = build_argv(&profile, None, false);
         assert!(!bare.iter().any(|a| a.starts_with("http")));
+        assert!(!bare.iter().any(|a| a.starts_with("--window-position")));
+    }
+
+    /// Embedded mode is the same headful browser with the window parked far
+    /// offscreen — placement flags only, never `--headless` or emulation.
+    #[test]
+    fn embedded_argv_is_offscreen_headful_not_headless() {
+        let profile = PathBuf::from("/data/real-browser/profiles/default");
+        let argv = build_argv(&profile, Some("https://example.com/"), true);
+        assert!(argv.iter().any(|a| a == EMBEDDED_POSITION_FLAG));
+        assert!(argv.iter().any(|a| a == EMBEDDED_SIZE_FLAG));
+        assert!(argv.iter().any(|a| a == EMBEDDED_OCCLUSION_FLAG));
+        assert_eq!(EMBEDDED_POSITION_FLAG, "--window-position=20000,20000");
+        assert_eq!(EMBEDDED_OCCLUSION_FLAG, "--disable-backgrounding-occluded-windows");
+        for forbidden in ["--headless", "--proxy-server", "--headless=new"] {
+            assert!(
+                !argv.iter().any(|a| a.starts_with(forbidden)),
+                "forbidden flag present: {forbidden}"
+            );
+        }
+        // Everything else stays identical to the pop-out launch.
+        let external = build_argv(&profile, Some("https://example.com/"), false);
+        let embedded_only = [EMBEDDED_POSITION_FLAG, EMBEDDED_SIZE_FLAG, EMBEDDED_OCCLUSION_FLAG];
+        let filtered: Vec<&String> = argv
+            .iter()
+            .filter(|a| !embedded_only.contains(&a.as_str()))
+            .collect();
+        assert_eq!(filtered, external.iter().collect::<Vec<_>>());
     }
 
     #[test]
@@ -583,7 +714,9 @@ mod tests {
         let real = RealChromium::default();
         let status = real.snapshot(None);
         assert_eq!(status.phase, RealPhase::Idle);
-        assert!(!status.installed);
+        // `installed` now means "openable without download": true on hosts
+        // with a system Chrome even before any first-use download.
+        assert_eq!(status.installed, openable(None));
         assert!(status.error.is_none());
         assert!(real.live().is_none());
 
@@ -633,5 +766,47 @@ mod tests {
         assert_eq!(json["version"], CFT_VERSION);
         assert!(json.get("progressPercent").is_some());
         assert!(json.get("progress_percent").is_none());
+        assert!(json.get("binary").is_some());
+    }
+
+    /// Stealth addendum 2026-09-13: the launch surface must never carry the
+    /// classic automation tells, in either mode, and the binary preference
+    /// is the user's own Google Chrome (real userAgentData brands) with the
+    /// bundled Chrome for Testing only as fallback.
+    #[test]
+    fn launch_flags_avoid_automation_tells_and_binary_prefers_system_chrome() {
+        let profile = PathBuf::from("/data/real-browser/profiles/default");
+        for embedded in [false, true] {
+            let argv = build_argv(&profile, Some("https://example.com/"), embedded);
+            for forbidden in [
+                "--enable-automation",
+                "--headless",
+                "--load-extension",
+                "--disable-extensions",
+                "--remote-debugging-pipe",
+                "--user-agent",
+            ] {
+                assert!(
+                    !argv.iter().any(|a| a.starts_with(forbidden)),
+                    "automation tell present ({embedded}): {forbidden}"
+                );
+            }
+        }
+        assert_eq!(
+            SYSTEM_CHROME_BINARY,
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+        );
+        // Preference order: system Chrome outranks the pinned CFT install.
+        if system_chrome_installed() {
+            assert_eq!(binary_kind(None), Some(BINARY_SYSTEM));
+            assert_eq!(
+                resolve_binary(Path::new("/nonexistent")).as_deref(),
+                Some(Path::new(SYSTEM_CHROME_BINARY))
+            );
+        } else {
+            assert_eq!(binary_kind(Some(Path::new("/nonexistent"))), None);
+            assert!(resolve_binary(Path::new("/nonexistent")).is_none());
+        }
+        assert!(!openable(Some(Path::new("/nonexistent"))) || system_chrome_installed());
     }
 }
