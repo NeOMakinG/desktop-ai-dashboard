@@ -58,7 +58,7 @@ class TestReadingListStore(unittest.TestCase):
         order = self.ids(self.store.list_entries())
         self.assertEqual(order, ["rl-000002", "rl-000003", "rl-000001"])
 
-    def test_equal_created_at_ties_break_by_id_ascending(self):
+    def test_equal_created_at_ties_order_by_id_ascending(self):
         self.store.add_entry("https://a.example", "A", now=700)
         self.store.add_entry("https://b.example", "B", now=700)
         self.store.add_entry("https://c.example", "C", now=700)
